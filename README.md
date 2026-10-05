@@ -11,6 +11,8 @@ Zero install: two files, no admin rights, no internet connection, MIT licensed.
 Discharge · 80% → 65% · 57 min · avg 7.9 W
 ```
 
+English | [日本語](README.ja-JP.md)
+
 ## What it measures — and what it honestly does not
 
 | | |
