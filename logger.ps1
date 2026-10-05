@@ -24,7 +24,8 @@ param(
   [string]$Label = '',
   [string]$KeepAwake = 'on',
   [string]$FromCsv = '',
-  [string]$Note = ''
+  [string]$Note = '',
+  [string]$Lang = ''
 )
 $ErrorActionPreference = 'Stop'
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
@@ -40,9 +41,9 @@ function FmtDur($sec) {
   $h = [long][math]::Floor($s / 3600)
   $m = [long][math]::Floor(($s % 3600) / 60)
   $ss = [long]($s % 60)
-  if ($h -gt 0) { return "${h}時間${m}分" }
-  if ($m -gt 0) { return "${m}分${ss}秒" }
-  return "${ss}秒"
+  if ($h -gt 0) { return (T 'dur.hm' @($h, $m)) }
+  if ($m -gt 0) { return (T 'dur.ms' @($m, $ss)) }
+  return (T 'dur.s' $ss)
 }
 function Esc($s) {
   return ([string]$s).Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;')
@@ -52,29 +53,350 @@ function JsStr($s) {
   $t = $t.Replace('\', '\\').Replace('"', '\"').Replace("`r", ' ').Replace("`n", ' ')
   return '"' + $t + '"'
 }
+# ---------- 停止理由（CSV には機械可読コードで保存 / 文言は生成時に引く） ----------
+# 保存行: `# stop: <code> k=v k=v`。文言を CSV に焼くと後から言語差し替えが出来ないため
+# コードのみ永続化し、ラベルはここで毎回組み立てる（-FromCsv で復元できる＝再生成で失わない）。
+function ArgOf($a, $k) { if ($a -and $a.ContainsKey($k)) { return $a[$k] } return '-' }
+function Stop-Label($code, $a) {
+  if (-not $code) { return (T 'stop.unknown' '-') }
+  switch ($code) {
+    'threshold_discharge' { return (T 'stop.th_dis' @((ArgOf $a 'pct'), (ArgOf $a 'stopat'))) }
+    'threshold_charge'    { return (T 'stop.th_chg' @((ArgOf $a 'pct'), (ArgOf $a 'stopat'))) }
+    'charge_done'         { return (T 'stop.chg_done' (ArgOf $a 'pct')) }
+    'full_from_start'     { return (T 'stop.full_start' (ArgOf $a 'pct')) }
+    'duration'            { return (T 'stop.duration' @((FmtDur ([double](ArgOf $a 'elapsed_s'))), (ArgOf $a 'minutes'))) }
+    'running'             { return (T 'stop.running') }
+    'missing'             { return (T 'stop.missing') }
+    default               { return (T 'stop.unknown' $code) }
+  }
+}
+function Stop-Line($code, $a) {
+  if (-not $code) { return '' }
+  $t = ''
+  if ($a) { $t = ' ' + (($a.GetEnumerator() | Sort-Object Key | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ') }
+  return "# stop: $code$t"
+}
+function Stop-Parse($line) {
+  $code = ($line -replace '^#\s*stop:\s*', '').Trim()
+  $toks = @($code -split '\s+' | Where-Object { $_ -ne '' })
+  $args2 = @{}
+  if ($toks.Count -gt 1) {
+    for ($i = 1; $i -lt $toks.Count; $i++) {
+      if ($toks[$i] -match '^([^=]+)=(.*)$') { $args2[$Matches[1]] = $Matches[2] }
+    }
+  }
+  return @($toks[0], $args2)
+}
 function TsLabel($d) { return $d.ToString('yyyyMMdd-HHmmss', $inv) }
 function IsoLocal($d) { return $d.ToString('yyyy-MM-ddTHH:mm:ss', $inv) }
+
+# ---------- 言語テーブル（-Lang en|ja / 既定は OS の表示言語） ----------
+# 文言はここに一元化する。CSV には日本語を焼かずコードのみ保存（Stop-Label は $L を参照）。
+$script:Lang = if ($Lang) { $Lang.ToLower() }
+               elseif ((Get-UICulture).Name -match '^ja') { 'ja' } else { 'en' }
+if ($script:Lang -ne 'ja' -and $script:Lang -ne 'en') { $script:Lang = 'en' }
+$script:L = if ($script:Lang -eq 'ja') {
+  @{
+    'menu.title'      = 'wattlog: モードを選択してください'
+    'menu.discharge'  = '  1) 放電計測（バッテリー駆動。残量閾値で自動停止）'
+    'menu.charge'     = '  2) 充電計測（電源接続。残量閾値または時間で自動停止）'
+    'menu.pick'       = '番号'
+    'menu.note'       = '計測条件のメモ（音量/WiFi/バックグラウンド等。電源プラン・輝度は自動取得）'
+    'menu.notePrompt' = 'メモ（Enter でスキップ）'
+    'err.mode'        = '--Mode は discharge|charge'
+    'err.keepAwake'   = '-KeepAwake は on|off'
+    'cond.plan'       = '電源プラン={0}'
+    'cond.bright'     = '輝度={0}%'
+    'cond.brightNa'   = '輝度=取得不可'
+    'cond.na'         = '不明'
+    'cond.none'       = '（条件記録なし）'
+    'stop.th_dis'     = '残量 {0}% が停止閾値 {1}% 以下'
+    'stop.th_chg'     = '残量 {0}% が停止閾値 {1}% 以上'
+    'stop.chg_done'   = '残量 {0}% / 充電完了（充電フラグOFF）'
+    'stop.full_start' = '残量 {0}% / 満充電（充電不要・開始時から）'
+    'stop.duration'   = '経過 {0} が指定時間 {1} 分に到達'
+    'stop.running'    = '計測中'
+    'stop.missing'    = '（このCSVに停止理由の記録なし＝強制終了の可能性）'
+    'stop.unknown'    = '停止コード {0}'
+    'csv.noDev'       = '（このCSVに端末情報記録なし）'
+    'csv.regen'       = '/ CSV から再生成'
+    'err.noCsv'       = 'CSV が見つかりません: {0}'
+    'err.noRows'      = 'CSV にデータ行がありません: {0}'
+    'html.regen'      = 'HTML 再生成: {0}'
+    'sum.samples'     = 'サンプル数 {0} / モード {1} / 残量 {2}%→{3}% / 累積 {4} Wh'
+    'dur.hm'          = '{0}時間{1}分'
+    'dur.ms'          = '{0}分{1}秒'
+    'dur.s'           = '{0}秒'
+    'dev.threads'     = '({0}コア{1}スレッド)'
+    'dev.display'     = '表示 {0}'
+    'dev.npuNone'     = 'NPU なし'
+    'dev.cycles'      = 'サイクル {0}回'
+    'dev.unavail'     = '（端末情報 取得不可）'
+    'svg.empty'       = 'データなし'
+    'svg.sep'         = ' ・ '
+    'card.model'      = '機種'
+    'card.device'     = '端末情報'
+    'card.cond'       = '計測条件'
+    'w.note'          = '移動中央値 約{0}秒'
+    'w.clip'          = '（上限は99パーセンタイルでクリップ）'
+    'chart.pct'       = '残量'
+    'chart.w'         = '瞬時消費電力'
+    'chart.wh'        = '累積消費電力量'
+    'page.h1'         = 'wattlog 計測結果'
+    'page.sub'        = 'システム全体の消費電力と残量の推移 / 生成 {0}'
+    'sum.loading'     = '区間を集計中…'
+    'btn.copy'        = 'サマリをコピー'
+    'btn.shot'        = 'スクショ用'
+    'btn.shotTip'     = '左カラムのスクロールを解除し操作UIを隠します。Escで戻ります'
+    'btn.copyTbl'     = '表をコピー'
+    'btn.copyTblHtml' = 'HTMLコピー'
+    'tile.avgw'       = '平均 W'
+    'tile.wh'         = '累積 Wh'
+    'tile.perpt'      = '1%あたり'
+    'meta.open'       = '計測情報（クリックで開閉）'
+    'meta.mode'       = 'モード'
+    'meta.start'      = '開始'
+    'meta.end'        = '終了'
+    'meta.samples'    = 'サンプル数'
+    'meta.elapsed'    = '経過'
+    'meta.interval'   = '間隔'
+    'meta.pctStart'   = '開始残量'
+    'meta.pctEnd'     = '終了残量'
+    'meta.pctDelta'   = '残量変化'
+    'meta.cumWh'      = '累積Wh'
+    'meta.avgW'       = '平均W'
+    'meta.stop'       = '停止理由'
+    'meta.fullWh'     = '満充電容量'
+    'meta.wsrc'       = 'W取得経路'
+    'tbl.title'       = '経過時間と電池残量'
+    'tbl.unit'        = '(記事貼り付け用の表)'
+    'tbl.step'        = '間隔:'
+    'tbl.s15'         = '15分'
+    'tbl.s30'         = '30分'
+    'tbl.s1h'         = '1時間'
+    'tbl.loading'     = '表を描画中…'
+    'foot'            = 'wattlog 第1段 / ゼロインストール・インラインSVG。この HTML 単体で開いてスクリーンショット可能。'
+    'wsrc.note'       = 'rate(直接)={0} / pct(算出)={1} / 取得不可={2}'
+    'run.start'       = 'wattlog 開始: mode={0} interval={1}s stop-at={2}%{3}'
+    'run.keepawake'   = 'keep-awake: on (set_ret={0}。アイドルスリープ防止 / 蓋閉じは未検証・powercfg LIDACTION が確実)'
+    'run.out'         = '出力先: {0}'
+    'run.sample'      = '[{0,5}s] 残量 {1} | W {2} ({3}) | 累積 {4} Wh | {5}{6}'
+    'run.charging'    = ' 充電中'
+    'run.measuring'   = '計測中'
+    'run.stop'        = '停止理由: {0}'
+    'run.samples'     = 'サンプル数: {0} / 経過: {1} s'
+    'run.level'       = '残量: {0}% → {1}% ({2} pt)'
+    'run.cum'         = '累積: {0} Wh / 平均: {1} W / keep-awake clear_ret={2}'
+    'run.wsrc'        = 'W取得経路: {0}'
+    'run.close'       = 'Enter でウィンドウを閉じます'
+  }
+} else {
+  @{
+    'menu.title'      = 'wattlog: select a mode'
+    'menu.discharge'  = '  1) Discharge (on battery, auto-stops at a level threshold)'
+    'menu.charge'     = '  2) Charge (plugged in, auto-stops at a threshold or duration)'
+    'menu.pick'       = 'Number'
+    'menu.note'       = 'Test conditions note (volume/WiFi/background). Power plan & brightness are captured automatically.'
+    'menu.notePrompt' = 'Note (Enter to skip)'
+    'err.mode'        = '--Mode must be discharge|charge'
+    'err.keepAwake'   = '-KeepAwake must be on|off'
+    'cond.plan'       = 'Power plan={0}'
+    'cond.bright'     = 'Brightness={0}%'
+    'cond.brightNa'   = 'Brightness=unavailable'
+    'cond.na'         = 'unknown'
+    'cond.none'       = '(no conditions recorded)'
+    'stop.th_dis'     = 'Level {0}% reached the stop threshold {1}%'
+    'stop.th_chg'     = 'Level {0}% reached the stop threshold {1}%'
+    'stop.chg_done'   = 'Level {0}% / charge complete (charging flag off)'
+    'stop.full_start' = 'Level {0}% / full from the start (no charging needed)'
+    'stop.duration'   = 'Elapsed {0} reached the {1} min limit'
+    'stop.running'    = 'Measuring'
+    'stop.missing'    = '(no stop reason in this CSV = possibly killed)'
+    'stop.unknown'    = 'Stop code {0}'
+    'csv.noDev'       = '(no device info in this CSV)'
+    'csv.regen'       = '/ rebuilt from CSV'
+    'err.noCsv'       = 'CSV not found: {0}'
+    'err.noRows'      = 'No data rows in CSV: {0}'
+    'html.regen'      = 'HTML rebuilt: {0}'
+    'sum.samples'     = 'Samples {0} / mode {1} / level {2}%->{3}% / {4} Wh'
+    'dur.hm'          = '{0}h {1}m'
+    'dur.ms'          = '{0}m {1}s'
+    'dur.s'           = '{0}s'
+    'dev.threads'     = '({0} cores, {1} threads)'
+    'dev.display'     = 'Display {0}'
+    'dev.npuNone'     = 'NPU none'
+    'dev.cycles'      = 'Cycles {0}'
+    'dev.unavail'     = '(device info unavailable)'
+    'svg.empty'       = 'No data'
+    'svg.sep'         = ' · '
+    'card.model'      = 'Model'
+    'card.device'     = 'Device'
+    'card.cond'       = 'Conditions'
+    'w.note'          = 'Moving median ~{0}s'
+    'w.clip'          = '(peak clipped at the 99th percentile)'
+    'chart.pct'       = 'Battery level'
+    'chart.w'         = 'Instant power'
+    'chart.wh'        = 'Cumulative energy'
+    'page.h1'         = 'wattlog report'
+    'page.sub'        = 'Whole-system power draw and battery level / generated {0}'
+    'sum.loading'     = 'Summarizing…'
+    'btn.copy'        = 'Copy summary'
+    'btn.shot'        = 'Screenshot mode'
+    'btn.shotTip'     = 'Unlocks the left column and hides the controls. Press Esc to exit'
+    'btn.copyTbl'     = 'Copy table'
+    'btn.copyTblHtml' = 'Copy HTML'
+    'tile.avgw'       = 'Avg W'
+    'tile.wh'         = 'Cumulative Wh'
+    'tile.perpt'      = 'Per 1%'
+    'meta.open'       = 'Measurement info (click to toggle)'
+    'meta.mode'       = 'Mode'
+    'meta.start'      = 'Start'
+    'meta.end'        = 'End'
+    'meta.samples'    = 'Samples'
+    'meta.elapsed'    = 'Elapsed'
+    'meta.interval'   = 'Interval'
+    'meta.pctStart'   = 'Start level'
+    'meta.pctEnd'     = 'End level'
+    'meta.pctDelta'   = 'Level change'
+    'meta.cumWh'      = 'Cumulative Wh'
+    'meta.avgW'       = 'Avg W'
+    'meta.stop'       = 'Stop reason'
+    'meta.fullWh'     = 'Full-charge capacity'
+    'meta.wsrc'       = 'W source'
+    'tbl.title'       = 'Elapsed time and battery level'
+    'tbl.unit'        = '(paste-ready table)'
+    'tbl.step'        = 'Step:'
+    'tbl.s15'         = '15 min'
+    'tbl.s30'         = '30 min'
+    'tbl.s1h'         = '1 hour'
+    'tbl.loading'     = 'Rendering table…'
+    'foot'            = 'wattlog / zero-install inline SVG. Open this single HTML file and take screenshots.'
+    'wsrc.note'       = 'rate(direct)={0} / pct(computed)={1} / unavailable={2}'
+    'run.start'       = 'wattlog start: mode={0} interval={1}s stop-at={2}%{3}'
+    'run.keepawake'   = 'keep-awake: on (set_ret={0}; prevents idle sleep / lid-close untested - powercfg LIDACTION is reliable)'
+    'run.out'         = 'Output dir: {0}'
+    'run.sample'      = '[{0,5}s] level {1} | W {2} ({3}) | cum {4} Wh | {5}{6}'
+    'run.charging'    = ' charging'
+    'run.measuring'   = 'Measuring'
+    'run.stop'        = 'Stop reason: {0}'
+    'run.samples'     = 'Samples: {0} / elapsed: {1} s'
+    'run.level'       = 'Level: {0}% -> {1}% ({2} pt)'
+    'run.cum'         = 'Cumulative: {0} Wh / avg: {1} W / keep-awake clear_ret={2}'
+    'run.wsrc'        = 'W source: {0}'
+    'run.close'       = 'Press Enter to close the window'
+  }
+}
+function T($key, $vals) { $f = $script:L[$key]; if ($null -eq $f) { return $key }; if ($vals) { return ($f -f $vals) } return $f }
+
+# ---------- JS用UI文言（HTML内で var UI として注入） ----------
+# $script:JSUI は単一引用ヒアストリング（補間不可）なので、言語テーブルをJSONで渡し、
+# JS側は UI.key を参照する。tf() は {0}{1}… 置換ヘルパー。
+$script:LJS = if ($script:Lang -eq 'ja') {
+  @{
+    'def'        = '始点クリック→終点クリックで区間統計（ドラッグでも可） / ホバー=値読取 / ダブルクリック=解除'
+    'durHm'      = '{0}時間{1}分'
+    'durH'       = '{0}時間'
+    'durMs'      = '{0}分{1}秒'
+    'durM'       = '{0}分'
+    'durS'       = '{0}秒'
+    'seg'        = '区間'
+    'avg'        = '平均'
+    'consume'    = '消費'
+    'recover'    = '回復'
+    'fullEst'    = '満充電→0%の推定'
+    'chipCharge' = '充電'
+    'chipDis'    = '放電'
+    'copied'     = 'コピーしました'
+    'copyFail'   = 'コピー失敗'
+    'copySum'    = 'サマリをコピー'
+    'sumHead'    = 'wattlog 計測サマリ'
+    'lMode'      = 'モード'
+    'lStart'     = '開始'
+    'lEnd'       = '終了'
+    'lElapsed'   = '経過'
+    'lLevel'     = '残量'
+    'lAvgW'      = '平均消費電力'
+    'lCum'       = '累積'
+    'lStop'      = '停止理由'
+    'lDev'       = '端末'
+    'lCond'      = '計測条件'
+    'hover'      = '{0} | 残量 {1}% | {2} W | 累積 {3} Wh'
+    'anchor'     = '始点 {0} を設定。終点をクリック（ダブルクリックで取消）'
+    'stats'      = '区間 {0} | 平均 {1} W | Δ% {2} = {3} %/h | ΔWh {4} = {5} Wh/h | n={6}'
+    'thStart'    = '開始'
+    'thEnd'      = '終了'
+    'thPct'      = '電池残量'
+    'thPctChg'   = '残量表示'
+    'thDiffDn'   = '減少差'
+    'thDiffUp'   = '回復差'
+    'btnTbl'     = '表をコピー'
+    'btnTblHtml' = 'HTMLコピー'
+    'toast'      = 'スクショ用モードです。撮影後 Esc で解除'
+  }
+} else {
+  @{
+    'def'        = 'Click the start then the end for segment stats (drag also works) / hover = read values / double-click = clear'
+    'durHm'      = '{0}h {1}m'
+    'durH'       = '{0}h'
+    'durMs'      = '{0}m {1}s'
+    'durM'       = '{0}m'
+    'durS'       = '{0}s'
+    'seg'        = 'Segment'
+    'avg'        = 'avg'
+    'consume'    = 'drain'
+    'recover'    = 'gain'
+    'fullEst'    = 'Estimated full->0%'
+    'chipCharge' = 'Charging'
+    'chipDis'    = 'Discharge'
+    'copied'     = 'Copied'
+    'copyFail'   = 'Copy failed'
+    'copySum'    = 'Copy summary'
+    'sumHead'    = 'wattlog summary'
+    'lMode'      = 'Mode'
+    'lStart'     = 'Start'
+    'lEnd'       = 'End'
+    'lElapsed'   = 'Elapsed'
+    'lLevel'     = 'Level'
+    'lAvgW'      = 'Avg power'
+    'lCum'       = 'cum'
+    'lStop'      = 'Stop reason'
+    'lDev'       = 'Device'
+    'lCond'      = 'Conditions'
+    'hover'      = '{0} | level {1}% | {2} W | cum {3} Wh'
+    'anchor'     = 'Start {0} set. Click the end point (double-click to cancel)'
+    'stats'      = 'Segment {0} | avg {1} W | Δ% {2} = {3} %/h | ΔWh {4} = {5} Wh/h | n={6}'
+    'thStart'    = 'Start'
+    'thEnd'      = 'End'
+    'thPct'      = 'Battery'
+    'thPctChg'   = 'Level shown'
+    'thDiffDn'   = 'Drop'
+    'thDiffUp'   = 'Gain'
+    'btnTbl'     = 'Copy table'
+    'btnTblHtml' = 'Copy HTML'
+    'toast'      = 'Screenshot mode. Press Esc when done'
+  }
+}
 
 # ---------- 起動モード ----------
 $showMenu = $false
 if (-not $FromCsv) {
 if (-not $Mode) {
   $showMenu = $true
-  Write-Host 'wattlog: モードを選択してください'
-  Write-Host '  1) 放電計測（バッテリー駆動。残量閾値で自動停止）'
-  Write-Host '  2) 充電計測（電源接続。残量閾値または時間で自動停止）'
-  $k = Read-Host '番号'
+  Write-Host (T 'menu.title')
+  Write-Host (T 'menu.discharge')
+  Write-Host (T 'menu.charge')
+  $k = Read-Host (T 'menu.pick')
   $Mode = if ($k -eq '2') { 'charge' } else { 'discharge' }
   if (-not $Note) {
-    Write-Host '計測条件のメモ（音量/WiFi/バックグラウンド等。電源プラン・輝度は自動取得）'
-    $Note = Read-Host 'メモ（Enter でスキップ）'
+    Write-Host (T 'menu.note')
+    $Note = Read-Host (T 'menu.notePrompt')
   }
 }
 $Mode = $Mode.ToLower()
-if ($Mode -ne 'discharge' -and $Mode -ne 'charge') { Write-Host '--Mode は discharge|charge'; exit 2 }
+if ($Mode -ne 'discharge' -and $Mode -ne 'charge') { Write-Host (T 'err.mode'); exit 2 }
 if ($Interval -le 0) { $Interval = 5 }
 if ($StopAt -lt 0) { $StopAt = if ($Mode -eq 'discharge') { 10 } else { 100 } }
-if ($KeepAwake -ne 'on' -and $KeepAwake -ne 'off') { Write-Host '-KeepAwake は on|off'; exit 2 }
+if ($KeepAwake -ne 'on' -and $KeepAwake -ne 'off') { Write-Host (T 'err.keepAwake'); exit 2 }
 }
 
 # ---------- バッテリー読み取り（プロセス内CIM・起動オーバーヘッドなし） ----------
@@ -114,7 +436,7 @@ function Stop-KeepAwake {
 
 # ---------- 計測条件（電源プラン・輝度を自動取得 / -Note を併記） ----------
 function Get-Conditions {
-  $plan = '不明'
+  $plan = T 'cond.na'
   try {
     $s = (& powercfg /getactivescheme) -join ' '
     $m = [regex]::Matches($s, '\(([^)]+)\)')
@@ -125,10 +447,10 @@ function Get-Conditions {
     $b = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBrightness -ErrorAction SilentlyContinue)
     foreach ($x in $b) { if ($null -ne $x.CurrentBrightness) { $bright = [int]$x.CurrentBrightness; break } }
   } catch {}
-  $parts = @("電源プラン=$plan")
-  $parts += if ($null -ne $bright) { "輝度=$bright%" } else { '輝度=取得不可' }
+  $parts = @((T 'cond.plan' $plan))
+  $parts += if ($null -ne $bright) { (T 'cond.bright' $bright) } else { (T 'cond.brightNa') }
   $auto = $parts -join ', '
-  if ($Note) { return "$auto / メモ: $Note" } else { return $auto }
+  if ($Note) { return "$auto / $Note" } else { return $auto }
 }
 
 # ---------- 端末情報（開始時に1回だけ取得・非管理者で読める範囲 / 読めない項目は黙って省略） ----------
@@ -158,7 +480,7 @@ function Get-DeviceInfo {
   } catch {}
   try {
     $cpu = @(Get-CimInstance Win32_Processor -ErrorAction Stop)[0]
-    if ($cpu) { $p += "CPU $(CleanName $cpu.Name) ($($cpu.NumberOfCores)コア$($cpu.NumberOfLogicalProcessors)スレッド)" }
+    if ($cpu) { $p += ('CPU ' + (CleanName $cpu.Name) + ' ' + (T 'dev.threads' @($cpu.NumberOfCores, $cpu.NumberOfLogicalProcessors))) }
   } catch {}
   try {
     $ram = [math]::Round(((Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | Measure-Object Capacity -Sum).Sum) / 1GB)
@@ -170,7 +492,7 @@ function Get-DeviceInfo {
     if ($gn.Count -gt 0) { $p += ('GPU ' + ($gn -join ' + ')) }
     $res = @($g | Where-Object { $_.CurrentHorizontalResolution -gt 0 } |
       ForEach-Object { "$($_.CurrentHorizontalResolution)x$($_.CurrentVerticalResolution)@$($_.CurrentRefreshRate)Hz" })
-    if ($res.Count -gt 0) { $p += ('表示 ' + ($res -join ' + ')) }
+    if ($res.Count -gt 0) { $p += (T 'dev.display' ($res -join ' + ')) }
   } catch {}
   try {
     $pd = @(Get-PhysicalDisk -ErrorAction Stop)
@@ -184,13 +506,13 @@ function Get-DeviceInfo {
       Where-Object { $_.Name -match '(?i)\bNPU\b|Hexagon|XDNA|AI Boost|Neural Processing' })
     if ($npu.Count -gt 0) {
       $p += ('NPU ' + (($npu | ForEach-Object { CleanName $_.Name } | Select-Object -Unique) -join ' + '))
-    } else { $p += 'NPU なし' }
+    } else { $p += (T 'dev.npuNone') }
   } catch {}
   try {
     $cyc = @(Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction SilentlyContinue)
-    foreach ($c in $cyc) { if ($c.CycleCount -gt 0) { $p += "サイクル $($c.CycleCount)回"; break } }
+    foreach ($c in $cyc) { if ($c.CycleCount -gt 0) { $p += (T 'dev.cycles' $c.CycleCount); break } }
   } catch {}
-  if ($p.Count -eq 0) { return '（端末情報 取得不可）' }
+  if ($p.Count -eq 0) { return (T 'dev.unavail') }
   return $p -join ' / '
 }
 
@@ -199,7 +521,7 @@ function New-SvgChart($Title, $Unit, $Points, $Color, $YFloor = $null, $YCap = $
   $W = 920; $H = 280; $ml = 64; $mr = 20; $mt = 16; $mb = 38
   $iw = $W - $ml - $mr; $ih = $H - $mt - $mb
   $valid = @($Points | Where-Object { $null -ne $_.y })
-  if ($valid.Count -eq 0) { return "<section><h2>$(Esc $Title)</h2><p class=`"empty`">データなし</p></section>" }
+  if ($valid.Count -eq 0) { return "<section><h2>$(Esc $Title)</h2><p class=`"empty`">$(T 'svg.empty')</p></section>" }
   $xMax = 1.0; foreach ($p in $Points) { if ($p.x -gt $xMax) { $xMax = [double]$p.x } }
   $dMin = [double]::MaxValue; $dMax = [double]::MinValue
   foreach ($p in $valid) { if ($p.y -lt $dMin) { $dMin = [double]$p.y }; if ($p.y -gt $dMax) { $dMax = [double]$p.y } }
@@ -231,7 +553,7 @@ function New-SvgChart($Title, $Unit, $Points, $Color, $YFloor = $null, $YCap = $
     $poly += "$(Fmt $px 1),$(Fmt $py 1) "
   }
   $unitLabel = "($(Esc $Unit))"
-  if ($Note) { $unitLabel = "($(Esc $Unit)) ・ $(Esc $Note)" }
+  if ($Note) { $unitLabel = "($(Esc $Unit))$(T 'svg.sep')$(Esc $Note)" }
   return @"
 <section>
   <h2>$(Esc $Title) <span class="unit">$unitLabel</span></h2>
@@ -256,16 +578,18 @@ $script:JSUI = @'
   var svgs=[].slice.call(document.querySelectorAll('svg'));
   var panel=document.getElementById('selpanel');
   var summary=document.getElementById('summary');
-  var DEF='始点クリック→終点クリックで区間統計（ドラッグでも可） / ホバー=値読取 / ダブルクリック=解除';
+  var DEF=(typeof UI!=='undefined'&&UI.def)?UI.def:'';
+  function tf(s){ var a=[].slice.call(arguments,1); return String(s).replace(/\{(\d)\}/g,function(m,i){return a[i];}); }
+  function U(k){ return (typeof UI!=='undefined'&&UI[k])?UI[k]:k; }
   var sel=null, drag=null, anchor=null, moved=false, downX=0, shot=false, prevOpen=true;
   function fmt(v,d){ return (v===null||v===undefined||isNaN(v))?'-':v.toFixed(d); }
   function fmtDur(s){
     if(s===null||s===undefined||isNaN(s)) return '-';
     s=Math.max(0,Math.round(s));
     var h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
-    if(h>0) return h+'時間'+m+'分';
-    if(m>0) return m+'分'+sec+'秒';
-    return sec+'秒';
+    if(h>0) return tf(U('durHm'),h,m);
+    if(m>0) return tf(U('durMs'),m,sec);
+    return tf(U('durS'),sec);
   }
   function paint(){
     svgs.forEach(function(sv){
@@ -293,7 +617,7 @@ $script:JSUI = @'
     var hrs=(b-a)/3600;
     var pph=(dp!==null&&hrs>0)? dp/hrs : null;
     var whh=(dwh!==null&&hrs>0)? dwh/hrs : null;
-    panel.textContent='区間 '+fmtDur(b-a)+' | 平均 '+fmt(avg,2)+' W | Δ% '+fmt(dp,2)+' = '+fmt(pph,1)+' %/h | ΔWh '+fmt(dwh,3)+' = '+fmt(whh,2)+' Wh/h | n='+ws.length;
+    panel.textContent=tf(U('stats'),fmtDur(b-a),fmt(avg,2),fmt(dp,2),fmt(pph,1),fmt(dwh,3),fmt(whh,2),ws.length);
   }
   function whole(){
     var f=DATA[0], l=DATA[DATA.length-1];
@@ -304,7 +628,7 @@ $script:JSUI = @'
     var avgW=ws.length? ws.reduce(function(x,y){return x+y;},0)/ws.length : null;
     var dwh=(f.h!==null&&f.h!==undefined&&l.h!==null&&l.h!==undefined)? l.h-f.h : null;
     var whh=(dwh!==null&&hrs>0)? dwh/hrs : null;
-    var dir=(dp!==null&&dp<0)?'消費':'回復';
+    var dir=(dp!==null&&dp<0)?U('consume'):U('recover');
     var fullWh=(typeof FULLWH!=='undefined')?FULLWH:null;
     var remH=(avgW&&avgW>0&&dp!==null&&dp<0&&fullWh)? fullWh/avgW : null;
     return {span:span,hrs:hrs,dp:dp,pph:pph,avgW:avgW,dwh:dwh,whh:whh,dir:dir,remH:remH};
@@ -314,12 +638,12 @@ $script:JSUI = @'
     if(!summary) return;
     var w=whole();
     var txt=fmt(w.whh,2)+' Wh/h';
-    if(w.remH!==null){ txt+=' | 満充電→0%の推定 '+fmtDur(w.remH*3600); }
-    var chip=(MODE==='charge')?'充電':(MODE==='discharge'?'放電':'');
+    if(w.remH!==null){ txt+=' | '+U('fullEst')+' '+fmtDur(w.remH*3600); }
+    var chip=(MODE==='charge')?U('chipCharge'):(MODE==='discharge'?U('chipDis'):'');
     var sp=(typeof META!=='undefined'&&META.startPct!=null)?Math.round(META.startPct):null;
     var ep=(typeof META!=='undefined'&&META.endPct!=null)?Math.round(META.endPct):null;
     var hasRange=(sp!=null&&ep!=null);
-    var chipHtml=(chip?'<span class="modechip">'+chip+'</span>':'')+'<span class="cap">区間</span>'
+    var chipHtml=(chip?'<span class="modechip">'+chip+'</span>':'')+'<span class="cap">'+U('seg')+'</span>'
       +(hasRange?'<span class="pctrange">'+sp+'% → '+ep+'%</span>':'');
     var head='<span class="bt-l">'+fmtDur(w.span)+'</span>';
     summary.innerHTML='<span class="chiprow">'+chipHtml+'</span><span class="bigtime">'+head+'</span><span class="sumline">'+txt+'</span>';
@@ -328,26 +652,26 @@ $script:JSUI = @'
     setT('tile-avgw', fmt(w.avgW,2));
     setT('tile-wh', fmt(w.dwh,3));
     var perPt=(w.dp&&w.span)?w.span/Math.abs(w.dp):null;
-    var perPtTxt=(perPt==null)?'-':(perPt>=60?(perPt/60).toFixed(1)+'分':Math.round(perPt)+'秒');
+    var perPtTxt=(perPt==null)?'-':(perPt>=60?tf(U('durM'),(perPt/60).toFixed(1)):tf(U('durS'),Math.round(perPt)));
     setT('tile-perpt', perPtTxt);
   }
   function buildCopy(){
     var w=whole(), m=(typeof META!=='undefined')?META:{};
     var L=[];
-    L.push('wattlog 計測サマリ');
-    L.push('モード: '+(m.mode||'-')+' / 開始 '+(m.start||'-')+' / 終了 '+(m.end||'-')+' / 経過 '+fmtDur(w.span));
-    L.push('残量: '+fmt(m.startPct,1)+'% → '+fmt(m.endPct,1)+'% (Δ '+fmt(w.dp,2)+' pt) / '+w.dir+' '+fmt(w.pph!==null?Math.abs(w.pph):null,1)+' %/h');
-    L.push('平均消費電力: '+fmt(w.avgW,2)+' W / '+fmt(w.whh,2)+' Wh/h / 累積 '+fmt(w.dwh,3)+' Wh');
-    if(w.remH!==null){ L.push('満充電→0%の推定: '+fmtDur(w.remH*3600)); }
-    L.push('停止理由: '+(m.stop||'-'));
-    if(m.dev){ L.push('端末: '+m.dev); }
-    L.push('計測条件: '+(m.cond||'-'));
+    L.push(U('sumHead'));
+    L.push(U('lMode')+': '+(m.mode||'-')+' / '+U('lStart')+' '+(m.start||'-')+' / '+U('lEnd')+' '+(m.end||'-')+' / '+U('lElapsed')+' '+fmtDur(w.span));
+    L.push(U('lLevel')+': '+fmt(m.startPct,1)+'% → '+fmt(m.endPct,1)+'% (Δ '+fmt(w.dp,2)+' pt) / '+w.dir+' '+fmt(w.pph!==null?Math.abs(w.pph):null,1)+' %/h');
+    L.push(U('lAvgW')+': '+fmt(w.avgW,2)+' W / '+fmt(w.whh,2)+' Wh/h / '+U('lCum')+' '+fmt(w.dwh,3)+' Wh');
+    if(w.remH!==null){ L.push(U('fullEst')+': '+fmtDur(w.remH*3600)); }
+    L.push(U('lStop')+': '+(m.stop||'-'));
+    if(m.dev){ L.push(U('lDev')+': '+m.dev); }
+    L.push(U('lCond')+': '+(m.cond||'-'));
     return L.join('\n');
   }
   function doCopy(){
     var btn=document.getElementById('copybtn'); if(!btn) return;
     var txt=buildCopy();
-    function done(ok){ btn.textContent=ok?'コピーしました':'コピー失敗'; btn.classList.add('done'); setTimeout(function(){ btn.textContent='サマリをコピー'; btn.classList.remove('done'); },1600); }
+    function done(ok){ btn.textContent=ok?U('copied'):U('copyFail'); btn.classList.add('done'); setTimeout(function(){ btn.textContent=U('copySum'); btn.classList.remove('done'); },1600); }
     function fallback(){
       try{
         var ta=document.createElement('textarea'); ta.value=txt; ta.style.position='fixed'; ta.style.opacity='0';
@@ -364,9 +688,9 @@ $script:JSUI = @'
   var TBL_HTML='', TBL_TEXT='';
   function tLabel(s){
     s=Math.round(s); var h=Math.floor(s/3600), m=Math.round((s%3600)/60);
-    if(h>0 && m>0) return h+'時間'+m+'分';
-    if(h>0) return h+'時間';
-    return m+'分';
+    if(h>0 && m>0) return tf(U('durHm'),h,m);
+    if(h>0) return tf(U('durH'),h);
+    return tf(U('durM'),m);
   }
   function pctAt(t){
     var best=DATA[0], bd=1e18;
@@ -377,7 +701,7 @@ $script:JSUI = @'
   function buildTable(){
     var host=document.getElementById('battable'); if(!host || !DATA.length) return;
     var l=DATA[DATA.length-1], span=l.t;
-    var rows=[{lb:'開始', p:pctAt(0)}];
+    var rows=[{lb:U('thStart'), st:'s', p:pctAt(0)}];
     var k=1, fullRow=false;
     while(k*TSTEP < span){
       var p=pctAt(k*TSTEP);
@@ -385,14 +709,14 @@ $script:JSUI = @'
       if(MODE==='charge' && p!==null && p>=99){ fullRow=true; break; } // 充電は満タン到達行で打ち切り（以降の100%横ばいはノイズ）
       k++;
     }
-    if(MODE!=='charge' || !fullRow) rows.push({lb:'終了', p:pctAt(span)});
+    if(MODE!=='charge' || !fullRow) rows.push({lb:U('thEnd'), st:'e', p:pctAt(span)});
     var isCharge = MODE==='charge';
-    var h='<table><tr><th></th><th>'+(isCharge?'残量表示':'電池残量')+'</th><th>'+(isCharge?'回復差':'減少差')+'</th></tr>';
-    var t='経過\t'+(isCharge?'残量表示':'電池残量')+'\t'+(isCharge?'回復差':'減少差');
+    var h='<table><tr><th></th><th>'+(isCharge?U('thPctChg'):U('thPct'))+'</th><th>'+(isCharge?U('thDiffUp'):U('thDiffDn'))+'</th></tr>';
+    var t=U('lElapsed')+'\t'+(isCharge?U('thPctChg'):U('thPct'))+'\t'+(isCharge?U('thDiffUp'):U('thDiffDn'));
     var prev=null;
     rows.forEach(function(r){
       var d=(r.p===null||prev===null) ? null : r.p-prev;
-      var dtxt=(r.lb==='開始') ? (r.p===null?'-':'0%') : diffTxt(d);
+      var dtxt=(r.st==='s') ? (r.p===null?'-':'0%') : diffTxt(d);
       var ptxt=(r.p===null) ? '-' : r.p+'%';
       h+='<tr><td>'+r.lb+'</td><td>'+ptxt+'</td><td>'+dtxt+'</td></tr>';
       t+='\n'+r.lb+'\t'+ptxt+'\t'+dtxt;
@@ -406,7 +730,7 @@ $script:JSUI = @'
   }
   function flash(btn,ok,orig){
     if(!btn) return;
-    btn.textContent=ok?'コピーしました':'コピー失敗'; btn.classList.add('done');
+    btn.textContent=ok?U('copied'):U('copyFail'); btn.classList.add('done');
     setTimeout(function(){ btn.textContent=orig; btn.classList.remove('done'); },1600);
   }
   function copyText(txt,btn,orig){
@@ -427,15 +751,15 @@ $script:JSUI = @'
       try{
         var r=document.createRange(); r.selectNodeContents(host);
         var s=window.getSelection(); s.removeAllRanges(); s.addRange(r);
-        var ok=document.execCommand('copy'); s.removeAllRanges(); flash(btn,ok,'表をコピー');
-      }catch(e){ flash(btn,false,'表をコピー'); }
+        var ok=document.execCommand('copy'); s.removeAllRanges(); flash(btn,ok,U('btnTbl'));
+      }catch(e){ flash(btn,false,U('btnTbl')); }
     }
     if(navigator.clipboard&&window.ClipboardItem){
       try{
         navigator.clipboard.write([new ClipboardItem({
           'text/html': new Blob([TBL_HTML],{type:'text/html'}),
           'text/plain': new Blob([TBL_TEXT],{type:'text/plain'})
-        })]).then(function(){ flash(btn,true,'表をコピー'); }, selFallback);
+        })]).then(function(){ flash(btn,true,U('btnTbl')); }, selFallback);
         return;
       }catch(e){}
     }
@@ -457,7 +781,7 @@ $script:JSUI = @'
         if(moved){ anchor=null; sel=[Math.min(drag,t),Math.max(drag,t)]; paint(); stats(); return; }
       }
       if(anchor!==null){ sel=[Math.min(anchor,t),Math.max(anchor,t)]; paint(); stats(); return; }
-      if(!sel){ panel.textContent=fmtDur(d.t)+' | 残量 '+fmt(d.p,1)+'% | '+fmt(d.w,2)+' W | 累積 '+fmt(d.h,3)+' Wh'; }
+      if(!sel){ panel.textContent=tf(U('hover'),fmtDur(d.t),fmt(d.p,1),fmt(d.w,2),fmt(d.h,3)); }
     });
     sv.addEventListener('mouseleave',function(){
       svgs.forEach(function(s2){ s2.querySelector('.hovline').setAttribute('visibility','hidden'); });
@@ -470,7 +794,7 @@ $script:JSUI = @'
       if(moved){ sel=[Math.min(drag,t),Math.max(drag,t)]; drag=null; moved=false; anchor=null; paint(); stats(); }
       else {
         drag=null; moved=false;
-        if(anchor===null){ anchor=t; sel=null; paint(); panel.textContent='始点 '+fmtDur(t)+' を設定。終点をクリック（ダブルクリックで取消）'; }
+        if(anchor===null){ anchor=t; sel=null; paint(); panel.textContent=tf(U('anchor'),fmtDur(t)); }
         else { sel=[Math.min(anchor,t),Math.max(anchor,t)]; anchor=null; paint(); stats(); }
       }
     });
@@ -482,7 +806,7 @@ $script:JSUI = @'
     c.addEventListener('click',function(){ setStep(Number(c.getAttribute('data-step'))); });
   });
   var tb=document.getElementById('copytbl'); if(tb){ tb.addEventListener('click',copyTableRich); }
-  var th=document.getElementById('copytblhtml'); if(th){ th.addEventListener('click',function(){ copyText(TBL_HTML,th,'HTMLコピー'); }); }
+  var th=document.getElementById('copytblhtml'); if(th){ th.addEventListener('click',function(){ copyText(TBL_HTML,th,U('btnTblHtml')); }); }
   // ---------- スクショ用モード: 左カラムのクリップ解除＋操作UI非表示＋ホバー/選択クリア（Escで解除） ----------
   var det=document.querySelector('details.metadtl');
   function toast(msg){
@@ -504,7 +828,7 @@ $script:JSUI = @'
       paint(); // sel=null で selrect は hidden になる
       svgs.forEach(function(s2){ var hl=s2.querySelector('.hovline'); if(hl) hl.setAttribute('visibility','hidden'); });
       if(panel) panel.textContent=DEF;
-      toast('スクショ用モードです。撮影後 Esc で解除');
+      toast(U('toast'));
     } else if(det){ det.open=prevOpen; }
   }
   var sb=document.getElementById('shotbtn'); if(sb){ sb.addEventListener('click',function(){ setShot(true); }); }
@@ -533,28 +857,28 @@ function Build-Html($Rows, $Meta) {
   # 端末カード: device 行を「機種 / OS / CPU… / サイクル」に分解して縦並びの kv 表へ
   $devCard = ''
   $devStr = [string]$Meta.device
-  if ($devStr -ne '' -and $devStr -notmatch '記録なし') {
+  if ($devStr -ne '' -and $devStr -notmatch '記録なし|取得不可' -and $devStr -notmatch 'unavailab|no device') {
     $parts = $devStr -split ' / '
     $model = ''; $os = ''; $kv = @()
     foreach ($p in $parts) {
       $t = ([string]$p).Trim()
       if ($t -eq '') { continue }
-      if ($t -match '^(CPU|RAM|GPU|表示|Disk|NPU|サイクル)\s+(.*)$') { $kv += ,@($matches[1], $matches[2]) }
+      if ($t -match '^(CPU|RAM|GPU|表示|Display|Disk|NPU|サイクル|Cycles)\s+(.*)$') { $kv += ,@($matches[1], $matches[2]) }
       elseif ($t -match '^(Windows|macOS)') { $os = $t }
       elseif ($model -eq '') { $model = $t }
       else { $kv += ,@('', $t) }
     }
     $rh = ''
-    if ($model -ne '') { $rh += '<tr><th>機種</th><td>' + (Esc $model) + '</td></tr>' }
+    if ($model -ne '') { $rh += '<tr><th>' + (T 'card.model') + '</th><td>' + (Esc $model) + '</td></tr>' }
     if ($os -ne '')    { $rh += '<tr><th>OS</th><td>' + (Esc $os) + '</td></tr>' }
     foreach ($pair in $kv) { $rh += '<tr><th>' + (Esc $pair[0]) + '</th><td>' + (Esc $pair[1]) + '</td></tr>' }
-    if ($rh -ne '') { $devCard = '<div class="card"><h3>端末情報</h3><table class="kv">' + $rh + '</table></div>' }
+    if ($rh -ne '') { $devCard = '<div class="card"><h3>' + (T 'card.device') + '</h3><table class="kv">' + $rh + '</table></div>' }
   }
   # 計測条件カード: 記録なし/なし/空 のときは出さない
   $condCard = ''
   $condStr = ([string]$Meta.conditions).Trim()
-  if ($condStr -ne '' -and $condStr -notmatch '記録なし' -and $condStr -ne 'なし') {
-    $condCard = '<div class="card"><h3>計測条件</h3><p class="condtxt">' + (Esc $condStr) + '</p></div>'
+  if ($condStr -ne '' -and $condStr -notmatch '記録なし|なし' -and $condStr -notmatch 'no conditions') {
+    $condCard = '<div class="card"><h3>' + (T 'card.cond') + '</h3><p class="condtxt">' + (Esc $condStr) + '</p></div>'
   }
   # 瞬時消費電力グラフ: 生値は数秒間隔のジッタ＋単発スパイクで橙の壁になるため、約1分窓の移動中央値で
   # トレンド線を出す（中央値は単発外れ値に強い）。残量/累積は元々滑らかなので非処理。
@@ -589,11 +913,12 @@ function Build-Html($Rows, $Meta) {
     if ($wCap -le 0) { $wCap = $null }
   }
   $wClip = ($null -ne $wCap)
-  $wNote = '移動中央値 約' + $wSec + '秒'
-  if ($wClip) { $wNote += '（上限は99パーセンタイルでクリップ）' }
+  $wNote = T 'w.note' $wSec
+  if ($wClip) { $wNote += ' ' + (T 'w.clip') }
+  $htmlLang = if ($script:Lang -eq 'ja') { 'ja' } else { 'en' }
   $tpl = @"
 <!doctype html>
-<html lang="ja"><head><meta charset="utf-8">
+<html lang="$htmlLang"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>wattlog — $(Esc $Meta.startIso)</title>
 <style>
@@ -681,88 +1006,98 @@ function Build-Html($Rows, $Meta) {
   footer { color:var(--muted); font-size:12px; margin-top:8px; }
 </style></head>
 <body><div class="wrap">
-  <h1>wattlog 計測結果</h1>
-  <p class="sub">システム全体の消費電力と残量の推移 / 生成 $(Esc $Meta.generatedIso)</p>
+  <h1>$(T 'page.h1')</h1>
+  <p class="sub">$(T 'page.sub' (Esc $Meta.generatedIso))</p>
   <div class="cols">
     <div class="colside">
       <div class="summaryrow">
-        <div class="panel summary" id="summary">区間を集計中…</div>
+        <div class="panel summary" id="summary">$(T 'sum.loading')</div>
         <div class="sumbtns">
-          <button type="button" id="copybtn" class="copybtn">サマリをコピー</button>
-          <button type="button" id="shotbtn" class="copybtn" title="左カラムのスクロールを解除し操作UIを隠します。Escで戻ります">スクショ用</button>
+          <button type="button" id="copybtn" class="copybtn">$(T 'btn.copy')</button>
+          <button type="button" id="shotbtn" class="copybtn" title="$(T 'btn.shotTip')">$(T 'btn.shot')</button>
         </div>
       </div>
       $devCard
       <div class="tiles">
         <div class="tile"><span class="tv" id="tile-pph">-</span><span class="tk" id="tile-pph-k">%/h</span></div>
-        <div class="tile"><span class="tv" id="tile-avgw">-</span><span class="tk">平均 W</span></div>
-        <div class="tile"><span class="tv" id="tile-wh">-</span><span class="tk">累積 Wh</span></div>
-        <div class="tile"><span class="tv" id="tile-perpt">-</span><span class="tk">1%あたり</span></div>
+        <div class="tile"><span class="tv" id="tile-avgw">-</span><span class="tk">$(T 'tile.avgw')</span></div>
+        <div class="tile"><span class="tv" id="tile-wh">-</span><span class="tk">$(T 'tile.wh')</span></div>
+        <div class="tile"><span class="tv" id="tile-perpt">-</span><span class="tk">$(T 'tile.perpt')</span></div>
       </div>
       $condCard
       <details class="metadtl">
-        <summary>計測情報（クリックで開閉）</summary>
+        <summary>$(T 'meta.open')</summary>
         <table class="meta">
-          <tr><th>モード</th><td>$(Esc $Meta.mode)</td></tr>
-          <tr><th>開始</th><td>$(Esc $Meta.startIso)</td></tr>
-          <tr><th>終了</th><td>$(Esc $Meta.endIso)</td></tr>
-          <tr><th>サンプル数</th><td>$($Rows.Count)</td></tr>
-          <tr><th>経過</th><td>$(FmtDur $Meta.elapsed_s)</td></tr>
-          <tr><th>間隔</th><td>$(Fmt $Meta.interval 0) s</td></tr>
-          <tr><th>開始残量</th><td>$(Fmt $Meta.startPct 1) %</td></tr>
-          <tr><th>終了残量</th><td>$(Fmt $Meta.endPct 1) %</td></tr>
-          <tr><th>残量変化</th><td>$dPct</td></tr>
-          <tr><th>累積Wh</th><td>$(Fmt $Meta.cumulative_wh 2) Wh</td></tr>
-          <tr><th>平均W</th><td>$(Fmt $Meta.avg_w 2) W</td></tr>
-          <tr><th>停止理由</th><td>$(Esc $Meta.stopReason)</td></tr>
-          <tr><th>満充電容量</th><td>$(Fmt $Meta.full_wh 1) Wh</td></tr>
-          <tr><th>W取得経路</th><td>$(Esc $Meta.wSourceNote)</td></tr>
+          <tr><th>$(T 'meta.mode')</th><td>$(Esc $Meta.mode)</td></tr>
+          <tr><th>$(T 'meta.start')</th><td>$(Esc $Meta.startIso)</td></tr>
+          <tr><th>$(T 'meta.end')</th><td>$(Esc $Meta.endIso)</td></tr>
+          <tr><th>$(T 'meta.samples')</th><td>$($Rows.Count)</td></tr>
+          <tr><th>$(T 'meta.elapsed')</th><td>$(FmtDur $Meta.elapsed_s)</td></tr>
+          <tr><th>$(T 'meta.interval')</th><td>$(Fmt $Meta.interval 0) s</td></tr>
+          <tr><th>$(T 'meta.pctStart')</th><td>$(Fmt $Meta.startPct 1) %</td></tr>
+          <tr><th>$(T 'meta.pctEnd')</th><td>$(Fmt $Meta.endPct 1) %</td></tr>
+          <tr><th>$(T 'meta.pctDelta')</th><td>$dPct</td></tr>
+          <tr><th>$(T 'meta.cumWh')</th><td>$(Fmt $Meta.cumulative_wh 2) Wh</td></tr>
+          <tr><th>$(T 'meta.avgW')</th><td>$(Fmt $Meta.avg_w 2) W</td></tr>
+          <tr><th>$(T 'meta.stop')</th><td>$(Esc $Meta.stopReason)</td></tr>
+          <tr><th>$(T 'meta.fullWh')</th><td>$(Fmt $Meta.full_wh 1) Wh</td></tr>
+          <tr><th>$(T 'meta.wsrc')</th><td>$(Esc $Meta.wSourceNote)</td></tr>
         </table>
       </details>
       <section>
-        <h2>経過時間と電池残量 <span class="unit">(記事貼り付け用の表)</span></h2>
+        <h2>$(T 'tbl.title') <span class="unit">$(T 'tbl.unit')</span></h2>
         <div class="tblbar">
-          <span class="chips">間隔:
-            <button type="button" class="chip" data-step="900">15分</button>
-            <button type="button" class="chip" data-step="1800">30分</button>
-            <button type="button" class="chip" data-step="3600">1時間</button>
+          <span class="chips">$(T 'tbl.step')
+            <button type="button" class="chip" data-step="900">$(T 'tbl.s15')</button>
+            <button type="button" class="chip" data-step="1800">$(T 'tbl.s30')</button>
+            <button type="button" class="chip" data-step="3600">$(T 'tbl.s1h')</button>
           </span>
-          <button type="button" id="copytbl" class="copybtn">表をコピー</button>
-          <button type="button" id="copytblhtml" class="copybtn">HTMLコピー</button>
+          <button type="button" id="copytbl" class="copybtn">$(T 'btn.copyTbl')</button>
+          <button type="button" id="copytblhtml" class="copybtn">$(T 'btn.copyTblHtml')</button>
         </div>
-        <div id="battable"><p class="empty">表を描画中…</p></div>
+        <div id="battable"><p class="empty">$(T 'tbl.loading')</p></div>
       </section>
     </div>
     <div class="colcharts">
-      <div class="panel" id="selpanel">始点クリック→終点クリックで区間統計（ドラッグでも可） / ホバー=値読取 / ダブルクリック=解除</div>
-      $(New-SvgChart '残量' '%' $pctPts '#2563a8' 0 100 $false 'pct')
-      $(New-SvgChart '瞬時消費電力' 'W' $wSmooth '#c2571a' 0 $wCap $wClip 'watt' $wNote)
-      $(New-SvgChart '累積消費電力量' 'Wh' $whPts '#0f766e' 0 $null $false 'wh')
+      <div class="panel" id="selpanel">$(Esc $script:LJS['def'])</div>
+      $(New-SvgChart (T 'chart.pct') '%' $pctPts '#2563a8' 0 100 $false 'pct')
+      $(New-SvgChart (T 'chart.w') 'W' $wSmooth '#c2571a' 0 $wCap $wClip 'watt' $wNote)
+      $(New-SvgChart (T 'chart.wh') 'Wh' $whPts '#0f766e' 0 $null $false 'wh')
     </div>
   </div>
-  <footer>wattlog 第1段 / ゼロインストール・インラインSVG。この HTML 単体で開いてスクリーンショット可能。</footer>
+  <footer>$(T 'foot')</footer>
 </div>
 "@
   $fullWhJs = if ($null -ne $Meta.full_wh) { Fmt $Meta.full_wh 3 } else { 'null' }
+  $uiJson = ($script:LJS | ConvertTo-Json -Compress)
   $metaJs = 'var META={mode:' + (JsStr $Meta.mode) + ',start:' + (JsStr $Meta.startIso) + ',end:' + (JsStr $Meta.endIso) +
             ',stop:' + (JsStr $Meta.stopReason) + ',cond:' + (JsStr $Meta.conditions) + ',dev:' + (JsStr $Meta.device) +
             ',startPct:' + $(if ($null -ne $Meta.startPct) { Fmt $Meta.startPct 2 } else { 'null' }) +
             ',endPct:' + $(if ($null -ne $Meta.endPct) { Fmt $Meta.endPct 2 } else { 'null' }) + '};'
-  return $tpl + "<script>var DATA=[$dataJs];var FULLWH=$fullWhJs;$metaJs</script>" + $script:JSUI + "</body></html>"
+  return $tpl + "<script>var DATA=[$dataJs];var FULLWH=$fullWhJs;var UI=$uiJson;$metaJs</script>" + $script:JSUI + "</body></html>"
 }
 
 # ---------- CSV から HTML 再生成（計測しない・UI変更後の確認用） ----------
 if ($FromCsv) {
-  if (-not (Test-Path $FromCsv)) { throw "CSV が見つかりません: $FromCsv" }
+  if (-not (Test-Path $FromCsv)) { throw (T 'err.noCsv' $FromCsv) }
   $csvFull = (Resolve-Path $FromCsv).Path
   $lines = @(Get-Content -Path $csvFull)
   $condLine = $lines | Where-Object { $_ -match '^#\s*conditions:' } | Select-Object -First 1
-  $conditions2 = if ($condLine) { ($condLine -replace '^#\s*conditions:\s*', '') } else { '（このCSVに条件記録なし）' }
+  $conditions2 = if ($condLine) { ($condLine -replace '^#\s*conditions:\s*', '') } else { (T 'cond.none') }
   $devLine = $lines | Where-Object { $_ -match '^#\s*device:' } | Select-Object -First 1
-  $device2 = if ($devLine) { ($devLine -replace '^#\s*device:\s*', '') } else { '（このCSVに端末情報記録なし）' }
+  $device2 = if ($devLine) { ($devLine -replace '^#\s*device:\s*', '') } else { (T 'csv.noDev') }
+  # 停止理由の復元: `# stop: <code> k=v` 行から言語ラベルを再組み立て（旧CSVは行が無いので missing 扱い）
+  $stopLine2 = $lines | Where-Object { $_ -match '^#\s*stop:' } | Select-Object -First 1
+  $stopParsed = if ($stopLine2) { Stop-Parse $stopLine2 } else { @('', $null) }
+  $stopCode2 = [string]$stopParsed[0]
+  $stopReason2 = if ($stopCode2) {
+    Stop-Label $stopCode2 $stopParsed[1]
+  } else {
+    Stop-Label 'missing' $null
+  }
   $dataLines = @($lines | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' })
   $raw = @($dataLines | ConvertFrom-Csv)
-  if ($raw.Count -eq 0) { throw "CSV にデータ行がありません: $FromCsv" }
+  if ($raw.Count -eq 0) { throw (T 'err.noRows' $FromCsv) }
   function Num($s) { if ($null -eq $s -or "$s".Trim() -eq '') { return $null }; return [double]::Parse($s, $inv) }
   $rows2 = New-Object System.Collections.Generic.List[object]
   foreach ($r in $raw) {
@@ -789,9 +1124,9 @@ if ($FromCsv) {
     generatedIso = IsoLocal (Get-Date); elapsed_s = $rows2[$rows2.Count - 1].elapsed_s
     startPct = $rows2[0].battery_pct; endPct = $rows2[$rows2.Count - 1].battery_pct
     cumulative_wh = $rows2[$rows2.Count - 1].cumulative_wh; avg_w = $avg2
-    stopReason = 'CSV から再生成（計測していない）'
+    stopReason = if ($stopCode2) { "$stopReason2 $(T 'csv.regen')" } else { $stopReason2 }
     full_wh = if ($lastFull) { $lastFull / 1000 } else { $null }
-    wSourceNote = "rate(直接)=$($cnt2.rate) / pct(算出)=$($cnt2.pct) / 取得不可=$($cnt2.none)"
+    wSourceNote = (T 'wsrc.note' @($cnt2.rate, $cnt2.pct, $cnt2.none))
     conditions = $conditions2; device = $device2
   }
   # -Out が絶対パスならそのまま使う（Join-Path で「C:\...\C:\...」になるのを防ぐ）。相対ならカレントに連結
@@ -800,9 +1135,8 @@ if ($FromCsv) {
   if (-not (Test-Path -LiteralPath $outDirR)) { New-Item -ItemType Directory -Path $outDirR | Out-Null }
   $html2 = Join-Path $outDirR "$baseName.html"
   Build-Html $rows2 $meta2 | Set-Content -Path $html2 -Encoding UTF8
-  Write-Host "HTML 再生成: $html2"
-  Write-Host ("サンプル数 {0} / モード {1} / 残量 {2}%→{3}% / 累積 {4} Wh" -f `
-    $rows2.Count, $mode2, (Fmt $meta2.startPct 1), (Fmt $meta2.endPct 1), (Fmt $meta2.cumulative_wh 2))
+  Write-Host (T 'html.regen' $html2)
+  Write-Host (T 'sum.samples' @($rows2.Count, $mode2, (Fmt $meta2.startPct 1), (Fmt $meta2.endPct 1), (Fmt $meta2.cumulative_wh 2)))
   return
 }
 
@@ -827,16 +1161,18 @@ $prev = $null
 $capacityWh = $null
 $counts = @{ rate = 0; pct = 0; none = 0 }
 $stopReason = ''
+$stopCode = ''
+$stopArg = $null
 $everCharged = $false
 $notChargingStreak = 0
 
-Write-Host ("wattlog 開始: mode={0} interval={1}s stop-at={2}%{3}" -f $Mode, $Interval, $StopAt, $(if ($Duration -gt 0) { " duration=$Duration min" } else { '' }))
+Write-Host ((T 'run.start') -f $Mode, $Interval, $StopAt, $(if ($Duration -gt 0) { " duration=$Duration min" } else { '' }))
 if ($KeepAwake -eq 'on') {
-  Write-Host ("keep-awake: on (set_ret={0}。アイドルスリープ防止 / 蓋閉じは未検証・powercfg LIDACTION が確実)" -f $esSet)
+  Write-Host ((T 'run.keepawake') -f $esSet)
 } else {
   Write-Host 'keep-awake: off'
 }
-Write-Host "出力先: $outDir"
+Write-Host (T 'run.out' $outDir)
 Write-Host ('-' * 72)
 
 function Write-SampleHtml($Meta) {
@@ -888,14 +1224,14 @@ while ($true) {
   ) -join ','
   Add-Content -Path $csvPath -Value $csvLine -Encoding ASCII
 
-  Write-Host ("[{0,5}s] 残量 {1} | W {2} ({3}) | 累積 {4} Wh | {5}{6}" -f `
+  Write-Host ((T 'run.sample') -f `
     $elapsed_s,
     $(if ($null -ne $pct) { "$(Fmt $pct 1)%" } else { ' n/a' }),
     $(if ($null -ne $watts) { Fmt $watts 2 } else { '  n/a' }),
     $wSource,
     (Fmt $cum 2),
     $(if ($d.power_online) { 'AC' } else { 'BAT' }),
-    $(if ($d.charging) { ' 充電中' } else { '' }))
+    $(if ($d.charging) { (T 'run.charging') } else { '' }))
 
   # サンプル毎にHTMLも更新（強制終了でも直前分まで残る）
   $wVals = @($rows | ForEach-Object { $_.watts } | Where-Object { $null -ne $_ })
@@ -904,9 +1240,9 @@ while ($true) {
     mode = $Mode; interval = $Interval; startIso = IsoLocal $start; endIso = IsoLocal $now
     generatedIso = IsoLocal $now; elapsed_s = $elapsed_s
     startPct = $rows[0].battery_pct; endPct = $row.battery_pct
-    cumulative_wh = $cum; avg_w = $avg; stopReason = if ($stopReason) { $stopReason } else { '計測中' }
+    cumulative_wh = $cum; avg_w = $avg; stopReason = if ($stopReason) { $stopReason } else { (T 'run.measuring') }
     full_wh = if ($full_mwh) { $full_mwh / 1000 } else { $null }
-    wSourceNote = "rate(直接)=$($counts.rate) / pct(算出)=$($counts.pct) / 取得不可=$($counts.none)"
+    wSourceNote = (T 'wsrc.note' @($counts.rate, $counts.pct, $counts.none))
     conditions = $conditions; device = $device
   }
   Write-SampleHtml $meta
@@ -918,21 +1254,33 @@ while ($true) {
     if ($d.charging) { $everCharged = $true; $notChargingStreak = 0 }
     elseif ($d.power_online) { $notChargingStreak += 1 }
     if ($notChargingStreak -ge 3) {
-      $why = if ($everCharged) { '充電完了（充電フラグOFF）' } else { '満充電（充電不要・開始時から）' }
-      $stopReason = "残量 $(Fmt $pct 1)% / $why"
+      $stopCode = if ($everCharged) { 'charge_done' } else { 'full_from_start' }
+      $stopArg = @{ pct = (Fmt $pct 1) }
+      $stopReason = Stop-Label $stopCode $stopArg
       break
     }
   }
 
   if ($null -ne $pct) {
-    if ($Mode -eq 'discharge' -and $pct -le $StopAt) { $stopReason = "残量 $(Fmt $pct 1)% が停止閾値 $StopAt% 以下"; break }
-    if ($Mode -eq 'charge' -and $pct -ge $StopAt) { $stopReason = "残量 $(Fmt $pct 1)% が停止閾値 $StopAt% 以上"; break }
+    if ($Mode -eq 'discharge' -and $pct -le $StopAt) {
+      $stopCode = 'threshold_discharge'; $stopArg = @{ pct = (Fmt $pct 1); stopat = $StopAt }
+      $stopReason = Stop-Label $stopCode $stopArg; break
+    }
+    if ($Mode -eq 'charge' -and $pct -ge $StopAt) {
+      $stopCode = 'threshold_charge'; $stopArg = @{ pct = (Fmt $pct 1); stopat = $StopAt }
+      $stopReason = Stop-Label $stopCode $stopArg; break
+    }
   }
-  if ($Duration -gt 0 -and $elapsed_s -ge $Duration * 60) { $stopReason = "経過 $elapsed_s s が指定時間 $Duration 分に到達"; break }
+  if ($Duration -gt 0 -and $elapsed_s -ge $Duration * 60) {
+    $stopCode = 'duration'; $stopArg = @{ elapsed_s = $elapsed_s; minutes = $Duration }
+    $stopReason = Stop-Label $stopCode $stopArg; break
+  }
 }
 
 # ---------- 終了処理 ----------
 Stop-KeepAwake
+# 停止理由を機械可読コードで CSV 末尾に追記（文言は焼かない。再生成時に言語を替えられる）
+if ($stopCode) { Add-Content -Path $csvPath -Value (Stop-Line $stopCode $stopArg) -Encoding ASCII }
 $end = Get-Date
 $elapsed_s = [math]::Round(($end - $start).TotalSeconds)
 $wVals = @($rows | ForEach-Object { $_.watts } | Where-Object { $null -ne $_ })
@@ -943,17 +1291,17 @@ $meta = [pscustomobject]@{
   startPct = $rows[0].battery_pct; endPct = $rows[$rows.Count - 1].battery_pct
   cumulative_wh = $cum; avg_w = $avg; stopReason = $stopReason
   full_wh = if ($rows[$rows.Count - 1].full_mwh) { $rows[$rows.Count - 1].full_mwh / 1000 } else { $null }
-  wSourceNote = "rate(直接)=$($counts.rate) / pct(算出)=$($counts.pct) / 取得不可=$($counts.none)"
+  wSourceNote = (T 'wsrc.note' @($counts.rate, $counts.pct, $counts.none))
   conditions = $conditions; device = $device
 }
 Write-SampleHtml $meta
 
 Write-Host ('-' * 72)
-Write-Host "停止理由: $stopReason"
-Write-Host "サンプル数: $($rows.Count) / 経過: $elapsed_s s"
-Write-Host ("残量: {0}% → {1}% ({2} pt)" -f (Fmt $meta.startPct 1), (Fmt $meta.endPct 1), (Fmt ($meta.endPct - $meta.startPct) 1))
-Write-Host ("累積: {0} Wh / 平均: {1} W / keep-awake clear_ret={2}" -f (Fmt $cum 2), $(if ($null -ne $avg) { Fmt $avg 2 } else { '-' }), $esClear)
-Write-Host ("W取得経路: {0}" -f $meta.wSourceNote)
+Write-Host (T 'run.stop' $stopReason)
+Write-Host ((T 'run.samples') -f $rows.Count, $elapsed_s)
+Write-Host ((T 'run.level') -f (Fmt $meta.startPct 1), (Fmt $meta.endPct 1), (Fmt ($meta.endPct - $meta.startPct) 1))
+Write-Host ((T 'run.cum') -f (Fmt $cum 2), $(if ($null -ne $avg) { Fmt $avg 2 } else { '-' }), $esClear)
+Write-Host (T 'run.wsrc' $meta.wSourceNote)
 Write-Host "CSV : $csvPath"
 Write-Host "HTML: $htmlPath"
-if ($showMenu) { Read-Host 'Enter でウィンドウを閉じます' | Out-Null }
+if ($showMenu) { Read-Host (T 'run.close') | Out-Null }

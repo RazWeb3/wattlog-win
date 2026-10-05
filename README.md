@@ -65,6 +65,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File logger.ps1 -FromCsv logs\wat
 | `-Out dir` | output directory (default `logs`, absolute paths accepted) |
 | `-KeepAwake on\|off` | prevent sleep during the run (default on) |
 | `-FromCsv csv` | skip measuring, rebuild the HTML from an existing CSV |
+| `-Lang en\|ja` | tool UI + report language (defaults to your Windows display language) |
 
 ## The report
 
@@ -80,6 +81,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File logger.ps1 -FromCsv logs\wat
 - **Machine spec, auto-captured** — model, OS build, CPU (cores/threads), RAM, GPU,
   resolution + refresh, disk types, NPU presence, battery cycle count. Read via
   CIM/registry as a normal user; unreadable items are skipped silently.
+- **Available in English & Japanese UI** — menus, console and report language follow
+  your Windows display language, or force it with `-Lang en|ja`. CSV data is
+  language-neutral, so any recorded CSV can be rebuilt as either language:
+  `logger.ps1 -FromCsv logs\run.csv -Lang en`.
 - **Self-contained** — one HTML file, inline SVG/JS, opens from disk or USB with no
   dependencies. Nothing is uploaded anywhere.
 
