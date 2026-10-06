@@ -38,7 +38,8 @@ non-commercial use only; wattlog is MIT.
 ## Quick start
 
 1. Copy the folder to the laptop you want to test (zip or USB — there is no installer).
-2. Double-click `wattlog.cmd`, pick discharge or charge.
+2. Double-click `wattlog.cmd`, pick discharge or charge, add a note about the
+   conditions, and optionally how many minutes to run (Enter = no time limit).
 3. Do the thing you want to measure. It stops itself at the threshold you set
    (default: 10% remaining) so the machine never hard-shuts-down mid-test.
 4. Open the generated HTML, hit **Screenshot mode**, publish. The CSV sits next to it.
@@ -68,6 +69,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File logger.ps1 -FromCsv logs\wat
 | `-KeepAwake on\|off` | prevent sleep during the run (default on) |
 | `-FromCsv csv` | skip measuring, rebuild the HTML from an existing CSV |
 | `-Lang en\|ja` | tool UI + report language (defaults to your Windows display language) |
+| `-Conf path` | settings file to load (default: `wattlog.conf` next to `logger.ps1`, ignored when absent) |
+
+### Settings file (wattlog.conf)
+
+Tired of typing the same flags? Copy `wattlog.conf.sample` to `wattlog.conf` next to
+`logger.ps1` and keep one `key=value` per line (`#` starts a comment, save as UTF-8):
+
+```
+interval=5
+duration=60
+stopat=10
+```
+
+Precedence: **command line > wattlog.conf > menu input > built-in default**, so a flag you
+type always wins over the file. Writable keys are `interval`, `stopat`, `duration`, `out`,
+`label`, `keepawake`, `lang`.
+
+`mode` and `note` are deliberately **not** configurable — discharge/charge and the test
+conditions change per run, so they are asked every time instead of being pinned in a file.
+
+Bad values stop the run with an error instead of quietly falling back to a default
+(a typo in `duration` must not silently disable the auto-stop you asked for).
+Unknown keys, empty values and lines that aren't `key=value` are skipped with a warning
+that names the line number.
+
+Each CSV records what actually was in effect, so a run measured weeks ago stays
+reproducible:
+
+```
+# params: mode=discharge interval=5.0 stopat=10.0 duration=60.0 keepawake=on lang=ja source=duration:conf
+# config: C:\tools\wattlog\wattlog.conf
+```
+
+`source=` lists only the keys that are **not** at their built-in default, tagged `cli`,
+`conf` or `menu`, and the `# config:` line is written only when a settings file was applied.
 
 ## The report
 

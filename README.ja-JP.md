@@ -37,7 +37,8 @@ wattlog は MIT です。
 ## クイックスタート
 
 1. テストしたいノートPCにこのフォルダをコピー（zip でも USB でも OK。インストーラーはありません）。
-2. `wattlog.cmd` をダブルクリックして、放電か充電を選びます。
+2. `wattlog.cmd` をダブルクリックして、放電か充電を選びます。計測条件のメモと、
+   必要なら「何分で停止するか」もここで聞きます（Enter で時間停止なし＝従来どおり閾値のみ）。
 3. 計測したい作業をします。設定した閾値（既定：残量10%）で自動停止するので、
    テスト中にそのまま電源が落ちることはありません。
 4. 生成された HTML を開いて**スクショ用**ボタンを押して公開。CSV は同じ場所に保存されます。
@@ -67,6 +68,39 @@ powershell -NoProfile -ExecutionPolicy Bypass -File logger.ps1 -FromCsv logs\wat
 | `-KeepAwake on\|off` | 計測中のスリープ防止（既定 on） |
 | `-FromCsv csv` | 計測をスキップし、既存CSVから HTML を再生成 |
 | `-Lang en\|ja` | ツールUIとレポートの言語（既定は Windows の表示言語） |
+| `-Conf path` | 読み込む設定ファイル（既定は `logger.ps1` と同階層の `wattlog.conf`。無ければ何もしない） |
+
+### 設定ファイル（wattlog.conf）
+
+毎回同じフラグを打つのが面倒なら、`wattlog.conf.sample` を `logger.ps1` と同じ階層に
+`wattlog.conf` としてコピーし、1行1項の `key=value`（`#` でコメント・UTF-8保存）で書きます。
+
+```
+interval=5
+duration=60
+stopat=10
+```
+
+優先順位は **コマンドライン引数 > wattlog.conf > メニュー入力 > 組み込み既定**。
+打った引数が常にファイルに勝つので、ファイル置いたまま例外運用もできます。
+書ける鍵は `interval` / `stopat` / `duration` / `out` / `label` / `keepawake` / `lang`。
+
+`mode` と `note` は意図的に設定ファイルの対象外にしています。 放電か充電か・計測条件は回ごとに変わるため、
+ファイルに固定せず毎回明示してもらいます（結果の誠実さを守るため）。
+
+値が不正なら、既定に黙って戻さずエラーで停止します（`duration` のタイプミスで
+「止まるはずが止まらなかった」を作るのが一番危ないため）。
+不明な鍵・空値・`key=value` でない行はその行だけ、行番号付きの警告を出して無視します。
+
+実際に効いた設定は CSV 先頭に記録されるので、いつ計測したものでも再現できます。
+
+```
+# params: mode=discharge interval=5.0 stopat=10.0 duration=60.0 keepawake=on lang=ja source=duration:conf
+# config: C:\tools\wattlog\wattlog.conf
+```
+
+`source=` は既定値で**ない**項目だけ（`cli` / `conf` / `menu` 付き）を列挙し、
+`# config:` 行は設定ファイルが効いた計測のときだけ書かれます。
 
 ## レポートの内容
 

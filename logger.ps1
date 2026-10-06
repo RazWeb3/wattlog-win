@@ -13,6 +13,11 @@
 #   -KeepAwake <on|off>       アイドルスリープ防止（既定 on）。蓋閉じは未検証
 #   -FromCsv <path>           計測せず既存CSVからHTMLだけ再生成（UI変更後の確認用）。指定時は他モード無視
 #   -Note <text>              計測条件の自由メモ（音量/WiFi/バックグラウンド等）。電源プラン・輝度は自動取得
+#   -Conf <path>              設定ファイル（既定は logger.ps1 と同階層の wattlog.conf。無ければ無視）
+#
+# 設定ファイル: `key=value`・1行1項・`#`でコメント。優先順位は CLI引数 > 設定ファイル > メ入力 > 組み込み既定。
+#   書ける鍵: interval / stopat / duration / out / label / keepawake / lang
+#   mode と note は回替わりの条件なので対象外（毎回メニューで聞く）
 #
 # CSV と HTML はサンプル毎に逐次書き込む。強制終了（窓を閉じる等）でも直前までのデータは残る。
 param(
@@ -25,10 +30,84 @@ param(
   [string]$KeepAwake = 'on',
   [string]$FromCsv = '',
   [string]$Note = '',
-  [string]$Lang = ''
+  [string]$Lang = '',
+  [string]$Conf = ''
 )
 $ErrorActionPreference = 'Stop'
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
+
+# ---------- 設定ファイル（wattlog.conf / -Conf） ----------
+# CLI引数 > 設定ファイル > メニュー入力 > 組み込み既定 の順で上書きする。
+# mode / note は計測回ごとの条件なので設定ファイルで固定しない（誠実性: 毎回明示させる）。
+# 報告文言は言語テーブル生成後（T が使えるようになってから）に出す。ここでは検出のみ。
+$CONF_NUM = @('interval', 'stopat', 'duration')
+$CONF_TXT = @('out', 'label')
+$CONF_ENUM = @{ keepawake = @('on', 'off'); lang = @('ja', 'en') }
+$CONF_DENY = @('mode', 'note')
+
+function Read-Conf($path) {
+  $map = @{}; $issues = @()
+  $lines = @(Get-Content -LiteralPath $path -Encoding UTF8)
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    # Get-Content -Encoding UTF8 でも先頭に BOM(U+FEFF)が残る場合がある
+    $ln = ([string]$lines[$i]).Replace([string][char]0xFEFF, '').Trim()
+    if ($ln -eq '' -or $ln.StartsWith('#')) { continue }
+    $kv = $ln -split '=', 2
+    if ($kv.Count -lt 2) { $issues += @{ kind = 'syntax'; key = $ln; line = ($i + 1) }; continue }
+    $k = $kv[0].Trim().ToLower(); $v = $kv[1].Trim()
+    if ($CONF_DENY -contains $k) { $issues += @{ kind = 'perRun'; key = $k; line = ($i + 1) }; continue }
+    if (-not (($CONF_NUM + $CONF_TXT + @($CONF_ENUM.Keys)) -contains $k)) {
+      $issues += @{ kind = 'unknown'; key = $k; line = ($i + 1) }; continue
+    }
+    if ($CONF_NUM -contains $k) {
+      $d = 0.0
+      $ok = [double]::TryParse($v, [System.Globalization.NumberStyles]::Float, $inv, [ref]$d)
+      if (-not $ok) { $issues += @{ kind = 'badNumber'; key = $k; val = $v; line = ($i + 1); fatal = $true }; continue }
+      $map[$k] = $d
+    } elseif ($CONF_ENUM.Keys -contains $k) {
+      $allow = $CONF_ENUM[$k]
+      if ($allow -notcontains $v.ToLower()) {
+        $issues += @{ kind = 'badEnum'; key = $k; val = $v; allow = ($allow -join '|'); line = ($i + 1); fatal = $true }; continue
+      }
+      $map[$k] = $v.ToLower()
+    } else {
+      if ($v -eq '') { $issues += @{ kind = 'empty'; key = $k; line = ($i + 1) }; continue }
+      $map[$k] = $v
+    }
+  }
+  return [pscustomobject]@{ map = $map; issues = @($issues) }
+}
+
+$script:confPath = ''
+$script:confKeys = @()
+$script:confIssues = @()
+$script:confFatal = $null
+if ($Conf) {
+  $script:confPath = if ([System.IO.Path]::IsPathRooted($Conf)) { $Conf } else { Join-Path $PSScriptRoot $Conf }
+} else {
+  $dc = Join-Path $PSScriptRoot 'wattlog.conf'
+  if (Test-Path -LiteralPath $dc) { $script:confPath = $dc }
+}
+if ($script:confPath) {
+  if (Test-Path -LiteralPath $script:confPath -PathType Container) {
+    # `-Conf conf` のようにディレクトリを渡されたとき、Get-Content の例外をそのまま出さない
+    $script:confFatal = @{ key = 'err.confDir'; arg = $script:confPath }
+  } elseif (-not (Test-Path -LiteralPath $script:confPath)) {
+    $script:confFatal = @{ key = 'err.confNoFile'; arg = $script:confPath }
+  } else {
+    $c = Read-Conf $script:confPath
+    $script:confIssues = $c.issues
+    $pnOf = @{ interval = 'Interval'; stopat = 'StopAt'; duration = 'Duration'; out = 'Out';
+               label = 'Label'; keepawake = 'KeepAwake'; lang = 'Lang' }
+    foreach ($k in ($c.map.Keys | Sort-Object)) {
+      $pn = $pnOf[$k]
+      # CLIで明示した値は設定ファイルより優先（上書きしない）
+      if ($PSBoundParameters.ContainsKey($pn)) { continue }
+      Set-Variable -Name $pn -Value $c.map[$k] -Scope Script
+      $script:confKeys += $k
+    }
+  }
+}
 
 function Fmt($v, $d) {
   if ($null -eq $v -or [double]::IsNaN([double]$v)) { return '' }
@@ -89,6 +168,25 @@ function Stop-Parse($line) {
 }
 function TsLabel($d) { return $d.ToString('yyyyMMdd-HHmmss', $inv) }
 function IsoLocal($d) { return $d.ToString('yyyy-MM-ddTHH:mm:ss', $inv) }
+# 有効値とその出所を CSV 先頭に機械可読で残す（# params:）。
+# 設定ファイル導入後は「この計測どの設定で回したか」がコマンドラインだけでは復元できないため。
+function Params-Line {
+  $p = "mode=$Mode interval=$(Fmt $Interval 1) stopat=$(Fmt $StopAt 1)"
+  if ($Duration -gt 0) { $p += " duration=$(Fmt $Duration 1)" }
+  $p += " keepawake=$KeepAwake lang=$script:Lang"
+  if ($script:src['label'] -ne 'default' -and $Label) { $p += " label=$Label" }
+  if ($script:src['out'] -ne 'default' -and $Out) { $p += " out=$Out" }
+  # 既定値でないものだけ（mode はファイル名に出る）
+  $ov = @($script:src.GetEnumerator() | Where-Object { $_.Value -ne 'default' -and $_.Key -ne 'mode' } |
+          Sort-Object Key | ForEach-Object { "$($_.Key):$($_.Value)" })
+  if ($ov.Count -gt 0) { $p += " source=$($ov -join ' ')" }
+  return "# params: $p"
+}
+# 設定ファイルが効いた計測なら、そのパスをCSVに残す（source=k:conf だけではどのファイルか復元できない）
+function Config-Line {
+  if ($script:confKeys.Count -eq 0) { return '' }
+  return "# config: $script:confPath"
+}
 
 # ---------- 言語テーブル（-Lang en|ja / 既定は OS の表示言語） ----------
 # 文言はここに一元化する。CSV には日本語を焼かずコードのみ保存（Stop-Label は $L を参照）。
@@ -103,8 +201,19 @@ $script:L = if ($script:Lang -eq 'ja') {
     'menu.pick'       = '番号'
     'menu.note'       = '計測条件のメモ（音量/WiFi/バックグラウンド等。電源プラン・輝度は自動取得）'
     'menu.notePrompt' = 'メモ（Enter でスキップ）'
+    'menu.duration'   = '自動停止する経過時間（分）。Enter で時間停止なし（残量閾値で停止）'
+    'menu.durationPrompt' = '分（Enter でスキップ）'
     'err.mode'        = '--Mode は discharge|charge'
     'err.keepAwake'   = '-KeepAwake は on|off'
+    'err.confNoFile'  = '設定ファイルが見つかりません: {0}'
+    'err.confDir'     = '設定ファイルのパスがディレクトリです: {0}'
+    'conf.loaded'     = '設定ファイル: {0}（適用: {1}）'
+    'conf.syntax'     = '設定ファイル {0}行目: key=value 形式でないので無視 ({1})'
+    'conf.unknown'    = '設定ファイル {0}行目: 不明な鍵 ''{1}'' を無視'
+    'conf.perRun'     = '設定ファイル {0}行目: {1} は計測回ごとの条件なので設定ファイルでは固定できません（起動時に聞きます）'
+    'conf.badNumber'  = '設定ファイル {0}行目: {1} の値が数値ではありません: {2}'
+    'conf.badEnum'    = '設定ファイル {0}行目: {1} は {2} のいずれかです: {3}'
+    'conf.empty'      = '設定ファイル {0}行目: {1} が空なので無視'
     'cond.plan'       = '電源プラン={0}'
     'cond.bright'     = '輝度={0}%'
     'cond.brightNa'   = '輝度=取得不可'
@@ -198,8 +307,19 @@ $script:L = if ($script:Lang -eq 'ja') {
     'menu.pick'       = 'Number'
     'menu.note'       = 'Test conditions note (volume/WiFi/background). Power plan & brightness are captured automatically.'
     'menu.notePrompt' = 'Note (Enter to skip)'
+    'menu.duration'   = 'Auto-stop after N minutes. Enter for no time limit (stops at the level threshold)'
+    'menu.durationPrompt' = 'Minutes (Enter to skip)'
     'err.mode'        = '--Mode must be discharge|charge'
     'err.keepAwake'   = '-KeepAwake must be on|off'
+    'err.confNoFile'  = 'Config file not found: {0}'
+    'err.confDir'     = 'Config path is a directory: {0}'
+    'conf.loaded'     = 'Config file: {0} (applied: {1})'
+    'conf.syntax'     = 'Config line {0}: not a key=value pair, ignored ({1})'
+    'conf.unknown'    = 'Config line {0}: unknown key ''{1}'', ignored'
+    'conf.perRun'     = 'Config line {0}: {1} is a per-run condition and cannot be set here (you will be asked at startup)'
+    'conf.badNumber'  = 'Config line {0}: {1} is not a number: {2}'
+    'conf.badEnum'    = 'Config line {0}: {1} must be one of {2}: {3}'
+    'conf.empty'      = 'Config line {0}: {1} is empty, ignored'
     'cond.plan'       = 'Power plan={0}'
     'cond.bright'     = 'Brightness={0}%'
     'cond.brightNa'   = 'Brightness=unavailable'
@@ -377,8 +497,37 @@ $script:LJS = if ($script:Lang -eq 'ja') {
   }
 }
 
+# ---------- 設定ファイルの結果を報告（ここで T が使える） ----------
+if ($script:confFatal) { Write-Host (T $script:confFatal.key $script:confFatal.arg); exit 2 }
+$confFatalIssue = $false
+foreach ($it in $script:confIssues) {
+  switch ($it.kind) {
+    'syntax'    { Write-Host (T 'conf.syntax'    @(($it.line), ($it.key))) }
+    'unknown'   { Write-Host (T 'conf.unknown'   @(($it.line), ($it.key))) }
+    'perRun'    { Write-Host (T 'conf.perRun'    @(($it.line), ($it.key))) }
+    'empty'     { Write-Host (T 'conf.empty'     @(($it.line), ($it.key))) }
+    'badNumber' { Write-Host (T 'conf.badNumber' @(($it.line), ($it.key), ($it.val))); $confFatalIssue = $true }
+    'badEnum'  { Write-Host (T 'conf.badEnum' @(($it.line), ($it.key), ($it.allow), ($it.val))); $confFatalIssue = $true }
+  }
+}
+if ($confFatalIssue) { exit 2 }
+if ($script:confKeys.Count -gt 0) {
+  Write-Host (T 'conf.loaded' @(($script:confPath), ($script:confKeys -join ' ')))
+}
+
+# 各有効値の出所（CLI / conf / menu / default）# params: 行の source= に入る
+$PN2K = @{ Interval = 'interval'; StopAt = 'stopat'; Duration = 'duration'; Out = 'out';
+           Label = 'label'; KeepAwake = 'keepawake'; Lang = 'lang' }
+$script:src = @{ mode = 'default' }
+foreach ($k in $PN2K.Values) { $script:src[$k] = 'default' }
+foreach ($pn in $PN2K.Keys) { if ($PSBoundParameters.ContainsKey($pn)) { $script:src[$PN2K[$pn]] = 'cli' } }
+if ($PSBoundParameters.ContainsKey('Mode')) { $script:src['mode'] = 'cli' }
+foreach ($k in $script:confKeys) { $script:src[$k] = 'conf' }
+
 # ---------- 起動モード ----------
 $showMenu = $false
+# 設定ファイル/CLIで決まった項目はメニューで聞かない（Enterで既定、の入力負担を減らす）
+$durationSet = ($PSBoundParameters.ContainsKey('Duration')) -or ($script:confKeys -contains 'duration')
 if (-not $FromCsv) {
 if (-not $Mode) {
   $showMenu = $true
@@ -387,9 +536,19 @@ if (-not $Mode) {
   Write-Host (T 'menu.charge')
   $k = Read-Host (T 'menu.pick')
   $Mode = if ($k -eq '2') { 'charge' } else { 'discharge' }
+  $script:src['mode'] = 'menu'
   if (-not $Note) {
     Write-Host (T 'menu.note')
     $Note = Read-Host (T 'menu.notePrompt')
+  }
+  if (-not $durationSet) {
+    Write-Host (T 'menu.duration')
+    $dv = 0.0
+    $ans = (Read-Host (T 'menu.durationPrompt')).Trim()
+    if ($ans -ne '' -and [double]::TryParse($ans, [System.Globalization.NumberStyles]::Float, $inv, [ref]$dv) -and $dv -gt 0) {
+      $Duration = $dv
+      $script:src['duration'] = 'menu'
+    }
   }
 }
 $Mode = $Mode.ToLower()
@@ -1152,7 +1311,8 @@ $htmlPath = Join-Path $outDir "$base.html"
 $CSV_HEADER = 'timestamp,elapsed_s,battery_pct,watts,w_source,charging,power_online,cumulative_wh,wh_per_hour,remaining_mwh,full_mwh'
 $conditions = Get-Conditions
 $device = Get-DeviceInfo
-Set-Content -Path $csvPath -Value @("# device: $device", "# conditions: $conditions", $CSV_HEADER) -Encoding UTF8
+$cfgLine = @(Config-Line | Where-Object { $_ })
+Set-Content -Path $csvPath -Value (@("# device: $device", "# conditions: $conditions", (Params-Line)) + $cfgLine + @($CSV_HEADER)) -Encoding UTF8
 
 $rows = New-Object System.Collections.Generic.List[object]
 $start = Get-Date

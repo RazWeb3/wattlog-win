@@ -1,0 +1,31 @@
+# wattlog configuration — copy this file to "wattlog.conf" (same folder as logger.ps1)
+# wattlog の設定ファイル — このファイルを "wattlog.conf" にコピーして logger.ps1 と同じ階層に置く
+#
+# 優先順位 / precedence:  CLI 引数 args  >  wattlog.conf  >  メニュー入力 menu  >  既定値 default
+# 1行1項 `key=value`。`#` で始まる行はコメント / one key=value per line, `#` starts a comment.
+# 保存するときは UTF-8 で（Save as UTF-8）.
+
+# サンプリング間隔（秒）/ sampling interval in seconds. default: 5
+interval=5
+
+# 残量閾値による自動停止（%）。discharge: 以下で停止 / charge: 以上で停止
+# Stop level in %. discharge: stops at or below, charge: at or above. default: discharge 10, charge 100
+#stopat=10
+
+# 経過分数で自動停止 / auto-stop after N minutes (uncomment to enable; e.g. 60 = 1 hour)
+#duration=60
+
+# 出力先ディレクトリ / output directory. default: logs
+#out=logs
+
+# ファイル名に付けるラベル / label appended to the file name
+#label=youtube-1h
+
+# アイドルスリープ防止 / keep-awake: on|off. default: on（蓋閉じは未検証 lid-close is untested）
+#keepawake=on
+
+# レポート言語 / report language: en|ja. default: OS 表示言語 OS UI language
+#lang=ja
+
+# mode と note はここでは設定できません（計測回ごとの条件なので起動時に聞きます）
+# mode / note cannot be set here — they are per-run conditions and are asked at startup.
