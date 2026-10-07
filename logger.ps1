@@ -206,6 +206,8 @@ $script:L = if ($script:Lang -eq 'ja') {
     'menu.notePrompt' = 'メモ（Enter でスキップ）'
     'menu.duration'   = '自動停止する経過時間（分）。Enter で時間停止なし（残量閾値で停止）'
     'menu.durationPrompt' = '分（Enter でスキップ）'
+    'menu.durationBad' = '入った値が分数ではありません: {0}（数字だけで入力。Enter だけなら時間停止なし）'
+    'err.duration'    = '経過時間が3回数字ではありませんでした（{0}）。計測を開始せず終了します'
     'src.default'     = '（既定）'
     'src.conf'        = '（設定ファイル）'
     'src.cli'         = '（CLI引数）'
@@ -318,6 +320,8 @@ $script:L = if ($script:Lang -eq 'ja') {
     'menu.notePrompt' = 'Note (Enter to skip)'
     'menu.duration'   = 'Auto-stop after N minutes. Enter for no time limit (stops at the level threshold)'
     'menu.durationPrompt' = 'Minutes (Enter to skip)'
+    'menu.durationBad' = 'Not a number of minutes: {0} (digits only; Enter alone = no time limit)'
+    'err.duration'    = 'Minutes input was not a number 3 times ({0}). Aborted before measuring'
     'src.default'     = ' (default)'
     'src.conf'        = ' (config file)'
     'src.cli'         = ' (CLI)'
@@ -557,13 +561,23 @@ if (-not $Mode) {
   $Mode = if ($k -eq '3' -or $k -eq '4') { 'charge' } else { 'discharge' }
   $script:src['mode'] = 'menu'
   # 時間入力を聞くのは 2)/4) を選んだときだけ（1)/3) は残量停止のみ）
+  # 数字以外は無視して黙って走らせない（=「指定したはずの時間停止が効いていない」事故）。
+  # Enter だけは「時間停止なし」の明示選択なので即確定。
   if (($k -eq '2' -or $k -eq '4') -and -not $durationSet) {
     Write-Host (T 'menu.duration')
-    $dv = 0.0
-    $ans = (Read-Host (T 'menu.durationPrompt')).Trim()
-    if ($ans -ne '' -and [double]::TryParse($ans, [System.Globalization.NumberStyles]::Float, $inv, [ref]$dv) -and $dv -gt 0) {
-      $Duration = $dv
-      $script:src['duration'] = 'menu'
+    $bad = 0
+    while ($true) {
+      $ans = (Read-Host (T 'menu.durationPrompt')).Trim()
+      if ($ans -eq '') { break }
+      $dv = 0.0
+      if ([double]::TryParse($ans, [System.Globalization.NumberStyles]::Float, $inv, [ref]$dv) -and $dv -gt 0) {
+        $Duration = $dv
+        $script:src['duration'] = 'menu'
+        break
+      }
+      $bad++
+      if ($bad -ge 3) { Write-Host (T 'err.duration' $ans); exit 2 }
+      Write-Host (T 'menu.durationBad' $ans)
     }
   }
   if (-not $Note) {

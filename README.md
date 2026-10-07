@@ -49,6 +49,8 @@ non-commercial use only; wattlog is MIT.
    Only 2 and 4 ask how many minutes; then one optional note about the conditions
    (Enter to skip). The thresholds shown are the values that will actually apply —
    if `wattlog.conf` or `-StopAt` changed them, you see the new number and where it came from.
+   Minutes are plain numbers (1 hour = `60`); an empty Enter means "no time limit" on purpose,
+   while a non-number warns and asks again, giving up before measuring after 3 bad entries.
 3. Do the thing you want to measure. It stops itself at the threshold you set
    (default: 10% remaining) so the machine never hard-shuts-down mid-test.
 4. Open the generated HTML, hit **Screenshot mode**, publish. The CSV sits next to it.
