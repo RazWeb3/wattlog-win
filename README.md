@@ -38,8 +38,17 @@ non-commercial use only; wattlog is MIT.
 ## Quick start
 
 1. Copy the folder to the laptop you want to test (zip or USB — there is no installer).
-2. Double-click `wattlog.cmd`, pick discharge or charge, add a note about the
-   conditions, and optionally how many minutes to run (Enter = no time limit).
+2. Double-click `wattlog.cmd` and pick one of four measurements — discharge or charge,
+   each by battery level or by minutes:
+   ```
+   1) Discharge (on battery): auto-stops at 10.0% remaining (default)
+   2) Discharge (on battery): stop after N minutes (ends early at 10.0%) (default)
+   3) Charge (plugged in): auto-stops at 100.0% or when charging completes (default)
+   4) Charge (plugged in): stop after N minutes (ends early at 100.0% or charge complete) (default)
+   ```
+   Only 2 and 4 ask how many minutes; then one optional note about the conditions
+   (Enter to skip). The thresholds shown are the values that will actually apply —
+   if `wattlog.conf` or `-StopAt` changed them, you see the new number and where it came from.
 3. Do the thing you want to measure. It stops itself at the threshold you set
    (default: 10% remaining) so the machine never hard-shuts-down mid-test.
 4. Open the generated HTML, hit **Screenshot mode**, publish. The CSV sits next to it.
@@ -59,7 +68,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File logger.ps1 -FromCsv logs\wat
 
 | Flag | Meaning |
 |---|---|
-| `-Mode discharge\|charge` | measurement mode (menu when omitted) |
+| `-Mode discharge\|charge` | measurement mode (skips the 4-choice menu) |
 | `-Interval s` | sampling interval, default 5 |
 | `-StopAt %` | auto-stop threshold — discharge stops at/below, charge at/above (default 10 / 100) |
 | `-Duration min` | stop after N minutes |

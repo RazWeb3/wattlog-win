@@ -1,5 +1,5 @@
 ﻿# wattlog 第1段 — ゼロインストール バッテリー電力ロガー（PowerShell ネイティブ）
-# 起動: wattlog.cmd をダブルクリック（メニューが出る）または
+# 起動: wattlog.cmd をダブルクリック（1放電・残量 / 2放電・時間 / 3充電・残量 / 4充電・時間 を選ぶ）または
 #       powershell -NoProfile -ExecutionPolicy Bypass -File logger.ps1 -Mode discharge -StopAt 10
 #
 # パラメータ:
@@ -15,7 +15,7 @@
 #   -Note <text>              計測条件の自由メモ（音量/WiFi/バックグラウンド等）。電源プラン・輝度は自動取得
 #   -Conf <path>              設定ファイル（既定は logger.ps1 と同階層の wattlog.conf。無ければ無視）
 #
-# 設定ファイル: `key=value`・1行1項・`#`でコメント。優先順位は CLI引数 > 設定ファイル > メ入力 > 組み込み既定。
+# 設定ファイル: `key=value`・1行1項・`#`でコメント。優先順位は CLI引数 > 設定ファイル > メニュー入力 > 組み込み既定。
 #   書ける鍵: interval / stopat / duration / out / label / keepawake / lang
 #   mode と note は回替わりの条件なので対象外（毎回メニューで聞く）
 #
@@ -195,14 +195,20 @@ $script:Lang = if ($Lang) { $Lang.ToLower() }
 if ($script:Lang -ne 'ja' -and $script:Lang -ne 'en') { $script:Lang = 'en' }
 $script:L = if ($script:Lang -eq 'ja') {
   @{
-    'menu.title'      = 'wattlog: モードを選択してください'
-    'menu.discharge'  = '  1) 放電計測（バッテリー駆動。残量閾値で自動停止）'
-    'menu.charge'     = '  2) 充電計測（電源接続。残量閾値または時間で自動停止）'
-    'menu.pick'       = '番号'
+    'menu.title'      = 'wattlog: 計測を選んでください'
+    'menu.disLevel'   = '  1) 放電（バッテリー駆動）: 残量 {0}%{1} で自動停止'
+    'menu.disTime'    = '  2) 放電（バッテリー駆動）: 時間を指定して自動停止／残量 {0}%{1} に達したらその時点で終了'
+    'menu.chgLevel'   = '  3) 充電（電源接続）: 残量 {0}%{1} または充電完了で自動停止'
+    'menu.chgTime'    = '  4) 充電（電源接続）: 時間を指定して自動停止／残量 {0}%{1}・充電完了でその時点で終了'
+    'menu.pick'       = '番号（1-4）'
+    'menu.pickBad'    = '番号は 1-4 のいずれかです。1) 放電（残量停止）で開始します'
     'menu.note'       = '計測条件のメモ（音量/WiFi/バックグラウンド等。電源プラン・輝度は自動取得）'
     'menu.notePrompt' = 'メモ（Enter でスキップ）'
     'menu.duration'   = '自動停止する経過時間（分）。Enter で時間停止なし（残量閾値で停止）'
     'menu.durationPrompt' = '分（Enter でスキップ）'
+    'src.default'     = '（既定）'
+    'src.conf'        = '（設定ファイル）'
+    'src.cli'         = '（CLI引数）'
     'err.mode'        = '--Mode は discharge|charge'
     'err.keepAwake'   = '-KeepAwake は on|off'
     'err.confNoFile'  = '設定ファイルが見つかりません: {0}'
@@ -301,14 +307,20 @@ $script:L = if ($script:Lang -eq 'ja') {
   }
 } else {
   @{
-    'menu.title'      = 'wattlog: select a mode'
-    'menu.discharge'  = '  1) Discharge (on battery, auto-stops at a level threshold)'
-    'menu.charge'     = '  2) Charge (plugged in, auto-stops at a threshold or duration)'
-    'menu.pick'       = 'Number'
+    'menu.title'      = 'wattlog: choose a measurement'
+    'menu.disLevel'   = '  1) Discharge (on battery): auto-stops at {0}% remaining{1}'
+    'menu.disTime'    = '  2) Discharge (on battery): stop after N minutes (ends early at {0}%){1}'
+    'menu.chgLevel'   = '  3) Charge (plugged in): auto-stops at {0}% or when charging completes{1}'
+    'menu.chgTime'    = '  4) Charge (plugged in): stop after N minutes (ends early at {0}% or charge complete){1}'
+    'menu.pick'       = 'Number (1-4)'
+    'menu.pickBad'    = 'Please enter 1-4. Starting with 1) Discharge (level stop)'
     'menu.note'       = 'Test conditions note (volume/WiFi/background). Power plan & brightness are captured automatically.'
     'menu.notePrompt' = 'Note (Enter to skip)'
     'menu.duration'   = 'Auto-stop after N minutes. Enter for no time limit (stops at the level threshold)'
     'menu.durationPrompt' = 'Minutes (Enter to skip)'
+    'src.default'     = ' (default)'
+    'src.conf'        = ' (config file)'
+    'src.cli'         = ' (CLI)'
     'err.mode'        = '--Mode must be discharge|charge'
     'err.keepAwake'   = '-KeepAwake must be on|off'
     'err.confNoFile'  = 'Config file not found: {0}'
@@ -531,17 +543,21 @@ $durationSet = ($PSBoundParameters.ContainsKey('Duration')) -or ($script:confKey
 if (-not $FromCsv) {
 if (-not $Mode) {
   $showMenu = $true
+  # 表示する閾値は実効値と同じ規則で先に出す（既定10/100、conf/CLI指定なら共用値）
+  $stopTag = switch ($script:src['stopat']) { 'cli' { T 'src.cli' } 'conf' { T 'src.conf' } default { T 'src.default' } }
+  $disShown = if ($StopAt -ge 0) { $StopAt } else { 10 }
+  $chgShown = if ($StopAt -ge 0) { $StopAt } else { 100 }
   Write-Host (T 'menu.title')
-  Write-Host (T 'menu.discharge')
-  Write-Host (T 'menu.charge')
-  $k = Read-Host (T 'menu.pick')
-  $Mode = if ($k -eq '2') { 'charge' } else { 'discharge' }
+  Write-Host (T 'menu.disLevel' @((Fmt $disShown 1), $stopTag))
+  Write-Host (T 'menu.disTime'  @((Fmt $disShown 1), $stopTag))
+  Write-Host (T 'menu.chgLevel' @((Fmt $chgShown 1), $stopTag))
+  Write-Host (T 'menu.chgTime'  @((Fmt $chgShown 1), $stopTag))
+  $k = (Read-Host (T 'menu.pick')).Trim()
+  if (@('1', '2', '3', '4') -notcontains $k) { Write-Host (T 'menu.pickBad'); $k = '1' }
+  $Mode = if ($k -eq '3' -or $k -eq '4') { 'charge' } else { 'discharge' }
   $script:src['mode'] = 'menu'
-  if (-not $Note) {
-    Write-Host (T 'menu.note')
-    $Note = Read-Host (T 'menu.notePrompt')
-  }
-  if (-not $durationSet) {
+  # 時間入力を聞くのは 2)/4) を選んだときだけ（1)/3) は残量停止のみ）
+  if (($k -eq '2' -or $k -eq '4') -and -not $durationSet) {
     Write-Host (T 'menu.duration')
     $dv = 0.0
     $ans = (Read-Host (T 'menu.durationPrompt')).Trim()
@@ -549,6 +565,10 @@ if (-not $Mode) {
       $Duration = $dv
       $script:src['duration'] = 'menu'
     }
+  }
+  if (-not $Note) {
+    Write-Host (T 'menu.note')
+    $Note = Read-Host (T 'menu.notePrompt')
   }
 }
 $Mode = $Mode.ToLower()
